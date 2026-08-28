@@ -66,14 +66,13 @@ export async function validate(
   dest: string,
   entries: ChangesetEntry[],
   run: Runner,
-  isSymlink?: (p: string) => boolean,
 ): Promise<ValidationResult[]> {
   const install = await run(["bun", "install"], dest);
   if (install.code !== 0) {
     throw new Error(`workspace install failed: ${install.output}`);
   }
 
-  assertLinked(dest, entries, isSymlink);
+  assertLinked(dest, entries);
 
   const results: ValidationResult[] = [];
   for (const entry of entries) {

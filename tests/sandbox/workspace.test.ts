@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { applyEntry, buildWorkspaceRoot, validate, assertLinked } from "../../src/sandbox/workspace";
@@ -45,17 +45,22 @@ test("validate reports per-package pass and failure from the runner", async () =
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, "package.json"), JSON.stringify({ name: e.pkg, version: e.fromVersion }));
   }
-  const results = await validate(
-    dest,
-    entries,
-    async (cmd, cwd) => {
-      if (cmd[0] === "bun" && cmd[1] === "install") return { code: 0, output: "installed" };
-      return cwd.includes("mail_box_components")
-        ? { code: 1, output: "TypeError: Button color missing" }
-        : { code: 0, output: "ok" };
-    },
-    () => true, // no real install here, so stub the linking check as satisfied
+  // Make the fixture honest: assertLinked runs for real inside validate(), so give it
+  // a real symlink for the one in-subgraph edge (@sudobility/components -> @sudobility/design)
+  // instead of bypassing the check.
+  const componentsNodeModulesScope = join(dest, "repos", "mail_box_components", "node_modules", "@sudobility");
+  mkdirSync(componentsNodeModulesScope, { recursive: true });
+  symlinkSync(
+    join(dest, "repos", "design_system"),
+    join(componentsNodeModulesScope, "design"),
+    "dir",
   );
+  const results = await validate(dest, entries, async (cmd, cwd) => {
+    if (cmd[0] === "bun" && cmd[1] === "install") return { code: 0, output: "installed" };
+    return cwd.includes("mail_box_components")
+      ? { code: 1, output: "TypeError: Button color missing" }
+      : { code: 0, output: "ok" };
+  });
   expect(results.map((r) => [r.pkg, r.ok])).toEqual([
     ["@sudobility/design", true],
     ["@sudobility/components", false],
