@@ -164,7 +164,8 @@ Confirm the `.pem` is **not** in the diff.
 **Interfaces:**
 - Consumes: findings from Task 1
 - Produces:
-  - `pemToDer(pem: string): Uint8Array`
+  - `pemToPkcs8Der(pem: string): Uint8Array` — accepts PKCS#1 or PKCS#8
+  - `pkcs1ToPkcs8(pkcs1: Uint8Array): Uint8Array`
   - `interface AppCredentials { appId: string; privateKeyPem: string }`
   - `mintAppJwt(creds: AppCredentials, nowSeconds: number): Promise<string>`
   - `interface InstallationToken { token: string; expiresAt: number }`
@@ -176,7 +177,7 @@ Create `tests/auth/appAuth.test.ts`:
 
 ```ts
 import { test, expect } from "bun:test";
-import { pemToDer } from "../../src/auth/pem";
+import { pemToPkcs8Der, pkcs1ToPkcs8 } from "../../src/auth/pem";
 import { mintAppJwt, TokenStore, type AppCredentials } from "../../src/auth/appAuth";
 
 async function generatePem(): Promise<string> {
@@ -190,14 +191,53 @@ async function generatePem(): Promise<string> {
   return `-----BEGIN PRIVATE KEY-----\n${b64}\n-----END PRIVATE KEY-----\n`;
 }
 
-test("pemToDer strips armour and whitespace", async () => {
-  const der = pemToDer(await generatePem());
+/** Strip the fixed PKCS#8 envelope to recover the inner PKCS#1 RSAPrivateKey. */
+function extractPkcs1(pkcs8: Uint8Array): Uint8Array {
+  // SEQUENCE hdr, INTEGER 0 (3 bytes), AlgorithmIdentifier (15 bytes), then OCTET STRING.
+  let i = 1;
+  i += pkcs8[i]! & 0x80 ? (pkcs8[i]! & 0x7f) + 1 : 1; // skip outer length
+  i += 3 + 15;
+  if (pkcs8[i] !== 0x04) throw new Error("expected OCTET STRING");
+  i += 1;
+  const lenByte = pkcs8[i]!;
+  i += lenByte & 0x80 ? (lenByte & 0x7f) + 1 : 1;
+  return pkcs8.slice(i);
+}
+
+test("pemToPkcs8Der strips armour and whitespace on a PKCS#8 key", async () => {
+  const der = pemToPkcs8Der(await generatePem());
   expect(der.byteLength).toBeGreaterThan(1000);
   expect(der[0]).toBe(0x30); // DER SEQUENCE
 });
 
-test("pemToDer rejects a non-PEM string", () => {
-  expect(() => pemToDer("not a key")).toThrow(/pem/i);
+test("pemToPkcs8Der rejects a non-PEM string", () => {
+  expect(() => pemToPkcs8Der("not a key")).toThrow(/pem/i);
+});
+
+test("a PKCS#1 key round-trips to importable PKCS#8", async () => {
+  // GitHub hands out PKCS#1; crypto.subtle only accepts PKCS#8. This is the
+  // conversion, and the assertion that matters is that importKey accepts the result.
+  const pkcs8 = pemToPkcs8Der(await generatePem());
+  const rewrapped = pkcs1ToPkcs8(extractPkcs1(pkcs8));
+  expect(Array.from(rewrapped)).toEqual(Array.from(pkcs8));
+  await expect(
+    crypto.subtle.importKey("pkcs8", rewrapped,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]),
+  ).resolves.toBeDefined();
+});
+
+test("a PKCS#1 PEM is detected by its armour and converted", async () => {
+  const pkcs8 = pemToPkcs8Der(await generatePem());
+  const pkcs1 = extractPkcs1(pkcs8);
+  const armoured =
+    "-----BEGIN RSA PRIVATE KEY-----\n" +
+    btoa(String.fromCharCode(...pkcs1)).replace(/(.{64})/g, "$1\n") +
+    "\n-----END RSA PRIVATE KEY-----\n";
+  const der = pemToPkcs8Der(armoured);
+  await expect(
+    crypto.subtle.importKey("pkcs8", der,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]),
+  ).resolves.toBeDefined();
 });
 
 test("mintAppJwt produces three base64url segments with the right claims", async () => {
@@ -268,12 +308,53 @@ test("TokenStore surfaces a failed exchange without leaking the JWT", async () =
 Run: `bun test tests/auth/appAuth.test.ts`
 Expected: FAIL — cannot resolve `../../src/auth/pem`.
 
-- [ ] **Step 3: Implement PEM conversion**
+- [ ] **Step 3: Implement PEM conversion (PKCS#1 aware)**
 
 Create `src/auth/pem.ts`:
 
 ```ts
-export function pemToDer(pem: string): Uint8Array {
+// GitHub downloads App keys as PKCS#1 (-----BEGIN RSA PRIVATE KEY-----), but
+// crypto.subtle.importKey supports only pkcs8/spki/raw/jwk — there is no "pkcs1".
+// Feeding it PKCS#1 throws `DataError`. Measured against a real App key; see
+// docs/spike-app-auth.md. A product cannot ask customers to run openssl, so we wrap
+// the PKCS#1 body in the fixed PKCS#8 envelope. No key parsing is needed.
+
+function derLength(n: number): number[] {
+  if (n < 0x80) return [n];
+  const bytes: number[] = [];
+  let v = n;
+  while (v > 0) { bytes.unshift(v & 0xff); v >>= 8; }
+  return [0x80 | bytes.length, ...bytes];
+}
+
+function derWrap(tag: number, content: Uint8Array): Uint8Array {
+  const len = derLength(content.length);
+  const out = new Uint8Array(1 + len.length + content.length);
+  out[0] = tag;
+  out.set(len, 1);
+  out.set(content, 1 + len.length);
+  return out;
+}
+
+/** rsaEncryption AlgorithmIdentifier: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL } */
+const RSA_ALGORITHM_ID = new Uint8Array([
+  0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+  0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+]);
+
+export function pkcs1ToPkcs8(pkcs1: Uint8Array): Uint8Array {
+  const version = new Uint8Array([0x02, 0x01, 0x00]); // INTEGER 0
+  const privateKey = derWrap(0x04, pkcs1); // OCTET STRING
+  const body = new Uint8Array(version.length + RSA_ALGORITHM_ID.length + privateKey.length);
+  body.set(version, 0);
+  body.set(RSA_ALGORITHM_ID, version.length);
+  body.set(privateKey, version.length + RSA_ALGORITHM_ID.length);
+  return derWrap(0x30, body); // SEQUENCE
+}
+
+/** Returns PKCS#8 DER regardless of whether the PEM was PKCS#1 or PKCS#8. */
+export function pemToPkcs8Der(pem: string): Uint8Array {
+  const isPkcs1 = /BEGIN RSA PRIVATE KEY/.test(pem);
   const body = pem.replace(/-----BEGIN [^-]+-----|-----END [^-]+-----/g, "").replace(/\s/g, "");
   if (body.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(body)) {
     throw new Error("not a PEM-encoded key");
@@ -281,7 +362,7 @@ export function pemToDer(pem: string): Uint8Array {
   const raw = atob(body);
   const der = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) der[i] = raw.charCodeAt(i);
-  return der;
+  return isPkcs1 ? pkcs1ToPkcs8(der) : der;
 }
 ```
 
@@ -290,7 +371,7 @@ export function pemToDer(pem: string): Uint8Array {
 Create `src/auth/appAuth.ts`:
 
 ```ts
-import { pemToDer } from "./pem";
+import { pemToPkcs8Der } from "./pem";
 
 export interface AppCredentials {
   appId: string;
@@ -313,7 +394,7 @@ export async function mintAppJwt(
   nowSeconds: number,
 ): Promise<string> {
   const key = await crypto.subtle.importKey(
-    "pkcs8", pemToDer(creds.privateKeyPem),
+    "pkcs8", pemToPkcs8Der(creds.privateKeyPem),
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"],
   );
   // GitHub rejects a JWT older than 60s or living beyond 10 minutes.
@@ -366,7 +447,7 @@ export class TokenStore {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `bun test tests/auth/appAuth.test.ts`
-Expected: PASS, 6 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
 
