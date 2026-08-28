@@ -1387,14 +1387,19 @@ export async function pollOnce(
     if (pr === undefined) continue;
 
     const ghState = await gh.prState(entry.repo, pr);
-    const next: NodeState = ghState === "MERGED" ? "merged" : "ci-running";
-    if (cascade.get(entry.pkg) !== next) {
-      cascade.set(entry.pkg, next);
-      lastChange.set(entry.pkg, now);
-    }
+    // Once stalled, stay stalled until gh reports a genuine resolution. Without this
+    // guard the flag erases itself: set() bumps lastChange only on a real change, so
+    // stalled -> ci-running is a change, which resets the clock every poll forever.
+    if (cascade.get(entry.pkg) === "stalled" && ghState !== "MERGED") continue;
+
+    const next: NodeState =
+      ghState === "MERGED" ? "merged" :
+      ghState === "CLOSED" ? "stalled" :
+      "ci-running";
+    cascade.set(entry.pkg, next, now);
   }
-  for (const pkg of detectStall(cascade, now, lastChange, STALL_TIMEOUT_MS)) {
-    cascade.set(pkg, "stalled");
+  for (const pkg of detectStall(cascade, now, STALL_TIMEOUT_MS)) {
+    cascade.set(pkg, "stalled", now);
   }
 }
 ```
@@ -1413,9 +1418,16 @@ export interface ServerDeps {
   onApprove: () => void;
 }
 
+import index from "../web/index.html";
+
 export function createServer(deps: ServerDeps, port = 3737) {
   return Bun.serve({
     port,
+    hostname: "127.0.0.1",
+    // Bun's HTML-import route transpiles main.tsx/App.tsx and serves them as real
+    // JavaScript. Serving index.html from a catch-all instead returns HTML for the
+    // browser's script request, and the screen never renders.
+    routes: { "/": index },
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -1443,7 +1455,7 @@ export function createServer(deps: ServerDeps, port = 3737) {
         });
       }
 
-      return new Response(Bun.file("src/web/index.html"));
+      return new Response("not found", { status: 404 });
     },
   });
 }
@@ -1544,7 +1556,21 @@ Create `src/web/index.html`:
 <script type="module" src="./main.tsx"></script></body></html>
 ```
 
-- [ ] **Step 4: Verify against a fake cascade**
+- [ ] **Step 4: Verify against a fake cascade — and verify the right thing**
+
+Two bugs shipped past this step's original wording because the check could not fail. Curl `/` and the
+two `/api/*` routes and everything looks healthy while the screen cannot render at all.
+
+**Confirm the browser actually receives JavaScript.** Fetch `/`, read the `<script src>` that Bun's
+router rewrote it to — it is `/_bun/client/index-<hash>.js`, **not** `/main.tsx` — and confirm that
+exact URL returns `Content-Type: text/javascript`. A request that returns `text/html` is the bug.
+
+Then, if you can, load the page in a real browser and watch a node change colour. Curl proves the
+bundle is served; only a browser proves React mounts and the SSE round-trip drives the view.
+
+Kill every server you start. Leave nothing bound to 3737.
+
+- [ ] **Step 4a: Drive the fake cascade**
 
 ```bash
 bun -e 'import{Cascade}from"./src/supervisor/state";
