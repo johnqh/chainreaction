@@ -113,8 +113,13 @@ justified them.
 Once the human approves the changeset:
 
 1. Push a branch per repo, open a PR per repo. Levels 2+ are red; nobody is looking at them yet.
-2. Sweep `gh pr review --approve` across all PRs, then `gh pr merge --auto --squash` on each. Every PR
-   is now armed to merge itself the instant its checks pass.
+2. Arm `gh pr merge --auto --squash` on every PR, so each merges itself the instant its checks pass.
+
+   > **Superseded.** This step originally swept `gh pr review --approve` first. Measured against a
+   > real PR: GitHub refuses `Can not approve your own pull request`, so with one identity opening
+   > and arming, the sweep threw on the first repo and *nothing* was armed. Protection for
+   > participating repos requires status checks only, never reviews, so no approval is needed — the
+   > human decision is ChainReaction's own gate. See the hosted spec §3.2.
 3. Level 0's PR is already green → auto-merges → `unified-cicd.yml` publishes to npm →
    **the publish job fires a `repository_dispatch` at each direct dependent.**
 4. Each dependent receives the dispatch, waits for the new version to be resolvable, re-runs CI on its
