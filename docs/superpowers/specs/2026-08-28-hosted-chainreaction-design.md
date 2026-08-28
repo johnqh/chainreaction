@@ -230,6 +230,18 @@ interface Validator {
 `LocalWorkspaceValidator` (built, reviewed, PR #3) and `ActionsValidator` (new). Same `assertLinked`
 contract, same `ValidationResult`.
 
+**The publish graph and the validation set are not the same set.** The graph follows
+`dependencies` and `peerDependencies` only, which is correct for deciding *who must be republished* —
+bumping a devDependency requires no version bump in the dependent. But a repo builds and tests
+against its devDependencies, so a breaking change can redden a downstream repo's CI without that repo
+ever entering the cascade. Measured example: `building_blocks` lists `@sudobility/di_web` only under
+`devDependencies`, so a `di_web` change never reaches it through the publish graph, while its test
+suite compiles against it.
+
+`ActionsValidator` should therefore validate the **devDependency closure** even though the cascade
+republishes only the dependency closure. Failing to do so leaves a cascade able to complete
+"successfully" while leaving a repo's `main` broken.
+
 ### 3.4 The cascade
 
 Unchanged in principle, with the dispatch shim deleted. Because the control plane holds an
