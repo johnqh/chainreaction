@@ -38,6 +38,7 @@ const REFRESH_MARGIN_SECONDS = 120;
 
 export class TokenStore {
   private cache = new Map<number, InstallationToken>();
+  private inFlight = new Map<number, Promise<string>>();
 
   constructor(
     private creds: AppCredentials,
@@ -50,6 +51,19 @@ export class TokenStore {
     const cached = this.cache.get(installationId);
     if (cached && cached.expiresAt - now > REFRESH_MARGIN_SECONDS) return cached.token;
 
+    // Concurrent callers for the same installation share one exchange in
+    // flight instead of each minting a JWT and hitting GitHub separately.
+    const existing = this.inFlight.get(installationId);
+    if (existing) return existing;
+
+    const exchange = this.exchange(installationId, now).finally(() => {
+      this.inFlight.delete(installationId);
+    });
+    this.inFlight.set(installationId, exchange);
+    return exchange;
+  }
+
+  private async exchange(installationId: number, now: number): Promise<string> {
     const jwt = await mintAppJwt(this.creds, now);
     const res = await this.fetchFn(
       `https://api.github.com/app/installations/${installationId}/access_tokens`,

@@ -123,3 +123,42 @@ test("TokenStore surfaces a failed exchange without leaking the JWT", async () =
   expect(message).toMatch(/401/);
   expect(message).not.toMatch(/BEGIN PRIVATE KEY|eyJ/);
 });
+
+test("TokenStore de-duplicates concurrent requests for the same installation", async () => {
+  const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls++;
+    // Resolve on a later tick so both concurrent get() calls genuinely
+    // overlap; a synchronously-resolving stub wouldn't exercise the race.
+    await new Promise((r) => setTimeout(r, 0));
+    return new Response(
+      JSON.stringify({ token: `tok-${calls}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }),
+      { status: 201 },
+    );
+  }) as unknown as typeof fetch;
+
+  const store = new TokenStore(creds, fetchFn);
+  const [a, b] = await Promise.all([store.get(42), store.get(42)]);
+  expect(a).toBe("tok-1");
+  expect(b).toBe("tok-1");
+  expect(calls).toBe(1);
+});
+
+test("TokenStore retries after a failed exchange instead of caching the rejection", async () => {
+  const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls++;
+    if (calls === 1) return new Response('{"message":"Bad credentials"}', { status: 401 });
+    return new Response(
+      JSON.stringify({ token: `tok-${calls}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }),
+      { status: 201 },
+    );
+  }) as unknown as typeof fetch;
+
+  const store = new TokenStore(creds, fetchFn);
+  await expect(store.get(7)).rejects.toThrow(/401/);
+  expect(await store.get(7)).toBe("tok-2");
+  expect(calls).toBe(2);
+});
