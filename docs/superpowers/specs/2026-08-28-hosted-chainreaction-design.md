@@ -114,15 +114,32 @@ stalling a cascade at level 3.
 
 Two measured constraints:
 
-- **Branch protection on a private repo requires a paid plan.** Verified during the spike:
-  `Upgrade to GitHub Pro or make this repository public to enable this feature` (HTTP 403). Prepare
-  must detect this and say so plainly. **Open question:** whether the newer rulesets API
-  (`/repos/{owner}/{repo}/rulesets`) has different plan gating. If it does, use rulesets. This must be
-  tested before Prepare is built, because it decides whether free-tier private repos can use the
-  product at all.
+- **Neither branch protection nor rulesets work on a free-tier private repo.** Both measured against
+  the same private repo, both HTTP 403:
+  `Upgrade to GitHub Pro or make this repository public to enable this feature`
+  (`PUT /branches/main/protection` and `POST /rulesets` alike). The open question is answered, and the
+  answer is negative: rulesets are not an escape hatch.
 - **Auto-merge needs an unsatisfied requirement to wait on.** A PR with nothing blocking it is simply
-  mergeable. So Prepare must set at least one *required status check*; a repo with no CI has no
-  mechanism and cannot participate.
+  mergeable, so protection must set at least one *required status check*.
+
+**Consequence: auto-merge cannot be the only merge mechanism, or the product excludes every free-tier
+private repo.** The escape is that a hosted, always-on control plane does not need GitHub to merge on
+its behalf. It already receives `check_suite` webhooks; when a waiting PR's checks go green it can
+simply call the merge API itself. Two mechanisms, chosen per repo at Prepare time:
+
+| Repo can be protected | Merge mechanism |
+|---|---|
+| yes | GitHub auto-merge, armed at launch — survives our downtime |
+| no (free-tier private) | **control-plane merge** on the `check_suite` green webhook |
+
+This reframes Prepare rather than removing it. Prepare still verifies access, records which mechanism
+a repo will use, and gates participation on a successful check — so an unpreparable repo is greyed out
+with a stated reason instead of silently stalling a cascade at level 3. Where protection is available
+it is still applied, because it also stops a human merging level 3 before level 1 has published.
+
+The cost of the fallback is honest: a control-plane merge depends on us being up, whereas an armed
+auto-merge does not. That is a real difference in failure mode and Prepare should say which one a repo
+got.
 
 ### 3.3 Validation in customer CI
 
@@ -263,7 +280,7 @@ tests, and `assertLinked` is shared verbatim with `ActionsValidator`.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Rulesets vs branch protection plan gating unknown | **High** — decides whether free-tier private repos can use it at all | Test before building Prepare |
+| ~~Rulesets vs branch protection plan gating~~ | **resolved** — both 403 on free-tier private repos; control-plane merge is the fallback | measured, §3.2 |
 | Deployment target unproven for a public MCP endpoint | High | Prove one round-trip from hosted TrueForge before building tools on it |
 | `ActionsValidator` checkout of N repos hits token/permission limits | **High** — it is now Phase 1 and the only validation path | Prove a two-repo checkout and build under an installation token before anything else in Phase 1 |
 | Validation consumes customer Actions minutes at 60-repo scale | Medium | Show the estimate before Trigger; let the user scope the target set |
