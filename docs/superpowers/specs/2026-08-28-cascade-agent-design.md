@@ -113,8 +113,13 @@ justified them.
 Once the human approves the changeset:
 
 1. Push a branch per repo, open a PR per repo. Levels 2+ are red; nobody is looking at them yet.
-2. Sweep `gh pr review --approve` across all PRs, then `gh pr merge --auto --squash` on each. Every PR
-   is now armed to merge itself the instant its checks pass.
+2. Arm `gh pr merge --auto --squash` on every PR, so each merges itself the instant its checks pass.
+
+   > **Superseded.** This step originally swept `gh pr review --approve` first. Measured against a
+   > real PR: GitHub refuses `Can not approve your own pull request`, so with one identity opening
+   > and arming, the sweep threw on the first repo and *nothing* was armed. Protection for
+   > participating repos requires status checks only, never reviews, so no approval is needed — the
+   > human decision is ChainReaction's own gate. See the hosted spec §3.2.
 3. Level 0's PR is already green → auto-merges → `unified-cicd.yml` publishes to npm →
    **the publish job fires a `repository_dispatch` at each direct dependent.**
 4. Each dependent receives the dispatch, waits for the new version to be resolvable, re-runs CI on its
@@ -189,17 +194,33 @@ The payload is chosen to be *visible*, which is what makes this a demo rather th
 Chain (verified against the real graph):
 
 ```
-@sudobility/design      (design_system)          ← change primary button color
+@sudobility/design      (design_system)          ← repoint `defaultTheme` at another preset
    └→ @sudobility/components   (mail_box_components)
         └→ @sudobility/di_web
              └→ @sudobility/building_blocks
-                  └→ sudobility-landing (sudobility)   ← refresh, button is a different color
+                  └→ sudobility-landing (sudobility)   ← refresh, the whole page has changed palette
 ```
+
+**The payload is a theme swap, not a hex tweak.** `design_system` ships 46 theme presets
+(`src/themes/presets/`: `commodore-64`, `vaporwave`, `game-boy`, `neo-brutalism`, `dracula`, `nord`,
+`y2k`, …), and `sudobility/src/main.tsx` does:
+
+```ts
+import { configureTheme } from '@sudobility/design';
+import { defaultTheme, generateThemeCSS } from '@sudobility/design/themes';
+configureTheme(defaultTheme);
+```
+
+The app imports `defaultTheme` **by name** and pins no preset of its own. So a one-line change at the
+deepest upstream repaints the entire landing page while the app's own diff stays empty — which is
+exactly the claim being demonstrated. A single button changing hue is hard to see on video and easy
+to attribute to a cache; a whole-page palette transformation that provably required four publishes
+to arrive is not.
 
 Five levels. `building_blocks` pulls in 11 `@sudobility` packages, so the rendered graph is a real DAG,
 not a line.
 
-**Script:** change the primary button color in `design_system` → agent computes the affected set and
+**Script:** repoint `defaultTheme` in `design_system` → agent computes the affected set and
 validates all five repos in one sandbox → one Approve click → cascade runs live in the DAG view →
 refresh the landing page, the button has changed.
 

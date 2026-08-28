@@ -34,7 +34,7 @@
 | `src/github/orchestrator.ts` | Open PRs, sweep-approve, arm auto-merge |
 | `src/supervisor/state.ts` | Node state machine + stall detection |
 | `src/supervisor/poller.ts` | Poll `gh` for run/PR status, emit deltas |
-| `src/harness/agent.ts` | TrueForge adapter — tool registration and interrupts |
+| `src/mcp/server.ts` | Streamable-http MCP server exposing the four tools to TrueForge |
 | `src/server/index.ts` | Bun HTTP server, SSE stream, approve endpoint |
 | `src/web/App.tsx` | The one screen: DAG view, approve button, log drawer |
 
@@ -746,9 +746,41 @@ export async function validate(
 Run: `bun test tests/sandbox/workspace.test.ts`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Validate the real five-repo chain manually**
+- [ ] **Step 5: (ALREADY VERIFIED — read, do not re-run)**
 
-This is the spec's second-highest risk (§11) — prove Bun workspace linking actually resolves `@sudobility/*` to local members before automating it.
+The controller ran this against the real five-repo chain before Task 4 was dispatched. Bun 1.3.10, 1296 packages, 77s install, and **every intra-subgraph edge resolved to a symlink** into the local workspace member. No `overrides` / `file:` fallback is needed. Two behaviours differ from what this plan originally assumed, and both bind your implementation:
+
+1. **Bun does not hoist workspace members to the root `node_modules`.** The root `node_modules/@sudobility` is *empty*; links live in each member's own `node_modules` (e.g. `repos/di_web/node_modules/@sudobility/components -> ../../../mail_box_components`). A check that looks only at the root will wrongly conclude linking failed.
+2. **Linking is conditional on the declared range being satisfied by the local version.** If a range does not match, Bun silently installs the **registry** copy instead. The install still succeeds, and validation then tests published code rather than the changeset — a confident false PASS, which is worse than no validation at all.
+
+Because of (2), `validate` gains a required assertion, and this is the reason it exists:
+
+```ts
+export function assertLinked(
+  dest: string,
+  entries: ChangesetEntry[],
+  isSymlink: (p: string) => boolean,
+): void {
+  const unlinked: string[] = [];
+  const inSubgraph = new Set(entries.map((e) => e.pkg));
+  for (const entry of entries) {
+    for (const dep of Object.keys(entry.depBumps)) {
+      if (!inSubgraph.has(dep)) continue;
+      const link = join(dest, memberDir(entry), "node_modules", dep);
+      if (!isSymlink(link)) unlinked.push(`${entry.pkg} -> ${dep}`);
+    }
+  }
+  if (unlinked.length > 0) {
+    throw new Error(
+      `validation would be a lie: these edges resolved to the registry, not the workspace: ${unlinked.join(", ")}`,
+    );
+  }
+}
+```
+
+Call it from `validate` immediately after the install succeeds and before any build or test runs. Inject `isSymlink` (default `(p) => lstatSync(p, { throwIfNoEntry: false })?.isSymbolicLink() ?? false`) so it is testable without a real install.
+
+Add a test asserting `assertLinked` throws when an edge is not a symlink, and does not throw when every edge is.
 
 ```bash
 WS=/tmp/cr-manual && rm -rf $WS && mkdir -p $WS/repos
@@ -1074,9 +1106,11 @@ In `/Users/johnhuang/projects/workflows/.github/workflows/unified-cicd.yml`, ins
 
 `continue-on-error: true` is deliberate: a cascade notification failure must never break an ordinary release for the other ~100 repos that are not part of a cascade. The `.chainreaction.json` guard is what keeps this inert outside a cascade — the orchestrator writes that file into each PR branch and it never reaches `main`.
 
-- [ ] **Step 6: Add the receiving trigger**
+- [ ] **Step 6: Add the receiving trigger — re-run path (CONFIRMED REQUIRED)**
 
-In the same file, extend the `on:` block of the reusable workflow's caller contract. Because callers use `workflow_call`, the `repository_dispatch` trigger must live in each repo's **stub**. Add to the stub template that Task 9 documents, and to the five demo repos now:
+The Task 1 spike settled this empirically: a `repository_dispatch` run carries **no PR association**. Its check attaches to `main`'s SHA, never the PR head, so the waiting PR stays red and auto-merge never fires. Measured on `johnqh/cr-spike-b`: the dispatch run *succeeded* on `main` while the PR check remained `FAILURE`. The re-run path is the design, not a contingency. See `docs/spike-findings.md` §1.
+
+Because callers use `workflow_call`, the `repository_dispatch` trigger must live in each repo's **stub**, not in `unified-cicd.yml`. Add to the five demo repos now, and to the stub template Task 9 documents:
 
 ```yaml
 on:
@@ -1086,9 +1120,54 @@ on:
     branches: [main, develop]
   repository_dispatch:
     types: [upstream-published]
+
+jobs:
+  cicd:
+    if: github.event_name != 'repository_dispatch'
+    uses: johnqh/workflows/.github/workflows/unified-cicd.yml@main
+    with:
+      npm-access: "public"
+    secrets: inherit
+
+  cascade_rerun:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the upstream version to be resolvable on npm
+        env:
+          PKG: ${{ github.event.client_payload.package }}
+          VER: ${{ github.event.client_payload.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if npm view "$PKG@$VER" version >/dev/null 2>&1; then
+              echo "resolvable after $((i*10))s"; exit 0
+            fi
+            echo "waiting for $PKG@$VER ($((i*10))s)"; sleep 10
+          done
+          echo "::error::$PKG@$VER never became resolvable"; exit 1
+
+      - name: Re-run the waiting PR's own failed checks
+        env:
+          GH_TOKEN: ${{ secrets.CR_DISPATCH_TOKEN }}
+          BRANCH: ${{ github.event.client_payload.branch }}
+        run: |
+          RUN_ID=$(gh run list -R "${{ github.repository }}" \
+            --branch "$BRANCH" --event pull_request \
+            --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::no pull_request run found for $BRANCH"; exit 1
+          fi
+          gh run rerun "$RUN_ID" --failed
 ```
 
-Then add the re-run step from Task 1 Step 7 if the spike showed dispatch does not satisfy the PR check directly.
+**The wait step is not optional, and its placement is the point.** `unified-cicd.yml`'s existing `check-npm-version` step compares the local version against `npm view <pkg> version` only to decide whether to publish — it is an idempotency guard, **not** a propagation wait, and nothing else in that pipeline waits for anything. If the rerun fires before the upstream version is resolvable, the downstream `bun install` fails against a version that does not exist yet, the PR goes red for a reason unrelated to the change, and the cascade stalls on the exact race this design exists to eliminate. Waiting *before* triggering the rerun means the rerun only ever starts against an installable dependency.
+
+Both failure paths `exit 1`, never `exit 0`. A cascade that cannot proceed must fail loudly: a silent success here produces a stalled chain that looks healthy, which is the worst failure mode in this system.
+
+Two further consequences of the spike, both binding:
+
+- `client_payload` must carry `branch`, `package`, and `version`. The sender in Step 5 already sends all three; without `branch` the handler cannot find the run, and without `package`/`version` it cannot wait.
+- `CR_DISPATCH_TOKEN` needs **`actions: write`** in addition to `contents: write`. A `contents`-only token fires the dispatch and then silently fails to re-run anything.
 
 - [ ] **Step 7: Verify on the spike repos, then commit**
 
@@ -1308,14 +1387,19 @@ export async function pollOnce(
     if (pr === undefined) continue;
 
     const ghState = await gh.prState(entry.repo, pr);
-    const next: NodeState = ghState === "MERGED" ? "merged" : "ci-running";
-    if (cascade.get(entry.pkg) !== next) {
-      cascade.set(entry.pkg, next);
-      lastChange.set(entry.pkg, now);
-    }
+    // Once stalled, stay stalled until gh reports a genuine resolution. Without this
+    // guard the flag erases itself: set() bumps lastChange only on a real change, so
+    // stalled -> ci-running is a change, which resets the clock every poll forever.
+    if (cascade.get(entry.pkg) === "stalled" && ghState !== "MERGED") continue;
+
+    const next: NodeState =
+      ghState === "MERGED" ? "merged" :
+      ghState === "CLOSED" ? "stalled" :
+      "ci-running";
+    cascade.set(entry.pkg, next, now);
   }
-  for (const pkg of detectStall(cascade, now, lastChange, STALL_TIMEOUT_MS)) {
-    cascade.set(pkg, "stalled");
+  for (const pkg of detectStall(cascade, now, STALL_TIMEOUT_MS)) {
+    cascade.set(pkg, "stalled", now);
   }
 }
 ```
@@ -1334,9 +1418,16 @@ export interface ServerDeps {
   onApprove: () => void;
 }
 
+import index from "../web/index.html";
+
 export function createServer(deps: ServerDeps, port = 3737) {
   return Bun.serve({
     port,
+    hostname: "127.0.0.1",
+    // Bun's HTML-import route transpiles main.tsx/App.tsx and serves them as real
+    // JavaScript. Serving index.html from a catch-all instead returns HTML for the
+    // browser's script request, and the screen never renders.
+    routes: { "/": index },
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -1364,7 +1455,7 @@ export function createServer(deps: ServerDeps, port = 3737) {
         });
       }
 
-      return new Response(Bun.file("src/web/index.html"));
+      return new Response("not found", { status: 404 });
     },
   });
 }
@@ -1465,7 +1556,21 @@ Create `src/web/index.html`:
 <script type="module" src="./main.tsx"></script></body></html>
 ```
 
-- [ ] **Step 4: Verify against a fake cascade**
+- [ ] **Step 4: Verify against a fake cascade — and verify the right thing**
+
+Two bugs shipped past this step's original wording because the check could not fail. Curl `/` and the
+two `/api/*` routes and everything looks healthy while the screen cannot render at all.
+
+**Confirm the browser actually receives JavaScript.** Fetch `/`, read the `<script src>` that Bun's
+router rewrote it to — it is `/_bun/client/index-<hash>.js`, **not** `/main.tsx` — and confirm that
+exact URL returns `Content-Type: text/javascript`. A request that returns `text/html` is the bug.
+
+Then, if you can, load the page in a real browser and watch a node change colour. Curl proves the
+bundle is served; only a browser proves React mounts and the SSE round-trip drives the view.
+
+Kill every server you start. Leave nothing bound to 3737.
+
+- [ ] **Step 4a: Drive the fake cascade**
 
 ```bash
 bun -e 'import{Cascade}from"./src/supervisor/state";
@@ -1505,31 +1610,51 @@ The TrueForge SDK surface has not been verified first-hand — the published sum
 - Consumes: everything from Tasks 2–8
 - Produces: a runnable agent and the hackathon submission
 
-- [ ] **Step 1: Install TrueForge and read the real SDK surface**
+- [ ] **Step 1: (ALREADY VERIFIED — read, do not re-probe)**
 
-```bash
-cd /Users/johnhuang/projects/chainreaction
-bun add @truefoundry/trueforge-sdk
-ls node_modules/@truefoundry/trueforge-sdk/dist/*.d.ts
-cat node_modules/@truefoundry/trueforge-sdk/package.json | jq '{main,module,types,exports}'
-```
+The controller probed `@truefoundry/trueforge-sdk@0.1.3` directly from its shipped `.d.ts` files before this task was dispatched. The published docs summary was second-hand and **wrong on the central point**. What is actually true:
 
-Read the `.d.ts` files. Record the **actual** tool-registration and interrupt APIs in `docs/spike-findings.md`. Do not write adapter code from the docs summary — write it from the type definitions.
+- The SDK is a Fern-generated REST client for a TrueForge **server**. There is no in-process agent runtime.
+- `AgentSpec = { model, instructions?, mcpServers?, skills?, config?, responseFormat?, messages? }`. **There is no `tools` field.** Tools reach an agent only through MCP.
+- `McpServerType` is `"remote"` **only**; transports are `streamable-http` | `sse`. **stdio is not supported.**
+- `mcpServers` has no `create()` — servers are configured server-side (Settings → Connectors) and referenced by name from an `AgentSpec`.
+- `McpServer.requireApprovalForTools` accepts `["@all" | "@write" | "@destructive" | <tool name>]` and **defaults to `["@write","@destructive"]`**.
+- `sessions.createTurnStream()` returns `Stream<TurnStreamingEvent>` carrying `ToolApprovalRequiredEvent { type: "tool.approval_required", threadId, toolCalls: [{ id, sourceEventId }] }`.
+- You answer an approval by posting a `TurnInputItem` via `sessions.createTurn()`: `UserToolApprovalEvent { type: "user.tool_approval", threadId, toolCallId, approval: { status: "allow" | "deny" } }`.
 
-- [ ] **Step 2: Write the adapter**
+**Consequence: the in-process adapter this plan originally described is impossible.** ChainReaction must run its own **streamable-http MCP server**, registered once in TrueForge's connector settings and referenced by name.
 
-Create `src/harness/agent.ts` exposing exactly four tools over the modules built in Tasks 2–8, using the API pinned in Step 1:
+Run TrueForge in **local mode** (`npx @truefoundry/trueforge`). Because MCP transport is remote-only, a hosted TrueForge could not reach a laptop-hosted MCP server without a tunnel, and spec §3 explicitly refuses tunnels.
+
+- [ ] **Step 2: Write the MCP server (NEW FILE — not in the original File Structure)**
+
+Create `src/mcp/server.ts`: a streamable-http MCP server exposing exactly four tools over the modules built in Tasks 2–8.
 
 | Tool | Backing module |
 |---|---|
 | `plan_cascade(changedPkg, targets)` | `scanRepos` → `affectedSubgraph` → `assertScoped` → `topoLevels` → `computeChangeset` |
-| `validate_changeset(entries)` | `buildWorkspaceRoot` → `validate` in the sandbox |
-| `launch_cascade(entries)` | `openChangesetPrs` → `armAll` (**gated behind the approval interrupt**) |
+| `validate_changeset(entries)` | `buildWorkspaceRoot` → `validate` (which calls `assertLinked`) |
+| `launch_cascade(entries)` | `openChangesetPrs` → `armAll` |
 | `cascade_status()` | `pollOnce` → `cascade.snapshot()` |
 
-`launch_cascade` must raise a TrueForge interrupt carrying the changeset and validation results, and must not proceed until resolved. That interrupt is Gate 1 from spec §6 and is the single most important line in the project.
+Keep this file thin: argument parsing, a call into the module, and JSON out. No orchestration logic lives here — that is what Tasks 2–8 are for.
 
-- [ ] **Step 3: Prepare the demo repos**
+- [ ] **Step 3: Wire the approval gate (one config line)**
+
+Gate 1 from spec §6 is **declarative**, not code. In the `AgentSpec` used to create the session:
+
+```ts
+mcpServers: [{
+  name: "chainreaction",
+  requireApprovalForTools: ["launch_cascade"],
+}]
+```
+
+`plan_cascade`, `validate_changeset`, and `cascade_status` are read-only and run unattended; `launch_cascade` is the only tool that opens PRs and arms auto-merge, so it is the only one that pauses. Do not add interrupt-handling code — TrueForge raises `tool.approval_required` on the turn stream and waits.
+
+The web app from Task 8 subscribes to `sessions.createTurnStream()`, renders the DAG when `tool.approval_required` arrives, and answers with a `user.tool_approval` turn input carrying the `toolCallId` from the event's `toolCalls[0].id`.
+
+- [ ] **Step 4: Prepare the demo repos**
 
 Add the `repository_dispatch` trigger (Task 6 Step 6) to the stubs in `design_system`, `mail_box_components`, `di_web`, `building_blocks`. Set `CR_DISPATCH_TOKEN` as an org secret. Enable auto-merge and branch protection on all five:
 
@@ -1541,7 +1666,7 @@ done
 
 Answering spec §12 Q1: wire Cloudflare Pages auto-deploy on merge to `main` for `sudobility`. If it resists, end the demo with a local `bun install && bun dev` — decide this before rehearsal, not during.
 
-- [ ] **Step 4: Rehearse against Verdaccio**
+- [ ] **Step 5: Rehearse against Verdaccio**
 
 ```bash
 bunx verdaccio --listen 4873
@@ -1549,17 +1674,17 @@ bunx verdaccio --listen 4873
 
 Point `.npmrc` at `http://localhost:4873`, run the full cascade end to end. Rehearsing against real npm burns public version numbers permanently.
 
-**Acceptance:** change the primary button color in `design_system`, approve once, and watch all five levels reach `published` with no further input.
+**Acceptance:** repoint `defaultTheme` in `design_system` at a visually distinct preset (`vaporwave`, `commodore-64`, `neo-brutalism`), approve once, and watch all five levels reach `published` with no further input. The landing page must repaint entirely although `sudobility`'s own diff contains nothing but a version bump.
 
-- [ ] **Step 5: Run live once, and record**
+- [ ] **Step 6: Run live once, and record**
 
 Switch to real npm, run the cascade, screen-record the DAG view alongside the landing page. Time-lapse to three minutes.
 
-- [ ] **Step 6: Write the README**
+- [ ] **Step 7: Write the README**
 
 Sections: what it does and the 59-repo problem statement; architecture diagram from spec §4; setup; the demo script; **"Qodo Code Review Evidence"** listing every merged PR and the Qodo feedback on it; a "Built with TrueForge" section naming sandbox, subagents, interrupts, and sessions and what each is load-bearing for.
 
-- [ ] **Step 7: Final commit and submission**
+- [ ] **Step 8: Final commit and submission**
 
 ```bash
 git checkout -b feat/harness-adapter
@@ -1572,14 +1697,16 @@ git push -u origin feat/harness-adapter && gh pr create --fill
 
 ## Cut List
 
-Budget is 21 hours against ~20 available (spec §10). Cut in this order:
+Budget is now **23 hours against ~20 available**. The original 21 assumed an in-process TrueForge
+adapter; Task 9's SDK probe found that impossible and added ~2h for `src/mcp/server.ts`
+(spec §10 for the original breakdown). Cut in this order:
 
 1. **Self-repair** — stall diagnosis narrows to "halt and report" (spec §7 already designates this the first cut)
 2. **Verdaccio rehearsal** — rehearse on two repos against real npm instead of five
 3. **Task 8 Step 4's animated states** — a static topological list with status badges still reads on video
 4. **Task 7's `detectStall`** — a manual refresh button replaces automatic stall detection
 
-**Never cut:** Task 1 (the spike), the Task 3 scoping guard, or Task 9 Steps 5–7. The last two hours belong to the video and README regardless of feature state.
+**Never cut:** Task 1 (the spike), the Task 3 scoping guard, the Task 4 `assertLinked` check, or Task 9 Steps 6–8. The last two hours belong to the video and README regardless of feature state.
 
 ---
 
