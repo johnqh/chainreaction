@@ -34,7 +34,7 @@
 | `src/github/orchestrator.ts` | Open PRs, sweep-approve, arm auto-merge |
 | `src/supervisor/state.ts` | Node state machine + stall detection |
 | `src/supervisor/poller.ts` | Poll `gh` for run/PR status, emit deltas |
-| `src/harness/agent.ts` | TrueForge adapter — tool registration and interrupts |
+| `src/mcp/server.ts` | Streamable-http MCP server exposing the four tools to TrueForge |
 | `src/server/index.ts` | Bun HTTP server, SSE stream, approve endpoint |
 | `src/web/App.tsx` | The one screen: DAG view, approve button, log drawer |
 
@@ -746,9 +746,41 @@ export async function validate(
 Run: `bun test tests/sandbox/workspace.test.ts`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Validate the real five-repo chain manually**
+- [ ] **Step 5: (ALREADY VERIFIED — read, do not re-run)**
 
-This is the spec's second-highest risk (§11) — prove Bun workspace linking actually resolves `@sudobility/*` to local members before automating it.
+The controller ran this against the real five-repo chain before Task 4 was dispatched. Bun 1.3.10, 1296 packages, 77s install, and **every intra-subgraph edge resolved to a symlink** into the local workspace member. No `overrides` / `file:` fallback is needed. Two behaviours differ from what this plan originally assumed, and both bind your implementation:
+
+1. **Bun does not hoist workspace members to the root `node_modules`.** The root `node_modules/@sudobility` is *empty*; links live in each member's own `node_modules` (e.g. `repos/di_web/node_modules/@sudobility/components -> ../../../mail_box_components`). A check that looks only at the root will wrongly conclude linking failed.
+2. **Linking is conditional on the declared range being satisfied by the local version.** If a range does not match, Bun silently installs the **registry** copy instead. The install still succeeds, and validation then tests published code rather than the changeset — a confident false PASS, which is worse than no validation at all.
+
+Because of (2), `validate` gains a required assertion, and this is the reason it exists:
+
+```ts
+export function assertLinked(
+  dest: string,
+  entries: ChangesetEntry[],
+  isSymlink: (p: string) => boolean,
+): void {
+  const unlinked: string[] = [];
+  const inSubgraph = new Set(entries.map((e) => e.pkg));
+  for (const entry of entries) {
+    for (const dep of Object.keys(entry.depBumps)) {
+      if (!inSubgraph.has(dep)) continue;
+      const link = join(dest, memberDir(entry), "node_modules", dep);
+      if (!isSymlink(link)) unlinked.push(`${entry.pkg} -> ${dep}`);
+    }
+  }
+  if (unlinked.length > 0) {
+    throw new Error(
+      `validation would be a lie: these edges resolved to the registry, not the workspace: ${unlinked.join(", ")}`,
+    );
+  }
+}
+```
+
+Call it from `validate` immediately after the install succeeds and before any build or test runs. Inject `isSymlink` (default `(p) => lstatSync(p, { throwIfNoEntry: false })?.isSymbolicLink() ?? false`) so it is testable without a real install.
+
+Add a test asserting `assertLinked` throws when an edge is not a symlink, and does not throw when every edge is.
 
 ```bash
 WS=/tmp/cr-manual && rm -rf $WS && mkdir -p $WS/repos
@@ -1505,31 +1537,51 @@ The TrueForge SDK surface has not been verified first-hand — the published sum
 - Consumes: everything from Tasks 2–8
 - Produces: a runnable agent and the hackathon submission
 
-- [ ] **Step 1: Install TrueForge and read the real SDK surface**
+- [ ] **Step 1: (ALREADY VERIFIED — read, do not re-probe)**
 
-```bash
-cd /Users/johnhuang/projects/chainreaction
-bun add @truefoundry/trueforge-sdk
-ls node_modules/@truefoundry/trueforge-sdk/dist/*.d.ts
-cat node_modules/@truefoundry/trueforge-sdk/package.json | jq '{main,module,types,exports}'
-```
+The controller probed `@truefoundry/trueforge-sdk@0.1.3` directly from its shipped `.d.ts` files before this task was dispatched. The published docs summary was second-hand and **wrong on the central point**. What is actually true:
 
-Read the `.d.ts` files. Record the **actual** tool-registration and interrupt APIs in `docs/spike-findings.md`. Do not write adapter code from the docs summary — write it from the type definitions.
+- The SDK is a Fern-generated REST client for a TrueForge **server**. There is no in-process agent runtime.
+- `AgentSpec = { model, instructions?, mcpServers?, skills?, config?, responseFormat?, messages? }`. **There is no `tools` field.** Tools reach an agent only through MCP.
+- `McpServerType` is `"remote"` **only**; transports are `streamable-http` | `sse`. **stdio is not supported.**
+- `mcpServers` has no `create()` — servers are configured server-side (Settings → Connectors) and referenced by name from an `AgentSpec`.
+- `McpServer.requireApprovalForTools` accepts `["@all" | "@write" | "@destructive" | <tool name>]` and **defaults to `["@write","@destructive"]`**.
+- `sessions.createTurnStream()` returns `Stream<TurnStreamingEvent>` carrying `ToolApprovalRequiredEvent { type: "tool.approval_required", threadId, toolCalls: [{ id, sourceEventId }] }`.
+- You answer an approval by posting a `TurnInputItem` via `sessions.createTurn()`: `UserToolApprovalEvent { type: "user.tool_approval", threadId, toolCallId, approval: { status: "allow" | "deny" } }`.
 
-- [ ] **Step 2: Write the adapter**
+**Consequence: the in-process adapter this plan originally described is impossible.** ChainReaction must run its own **streamable-http MCP server**, registered once in TrueForge's connector settings and referenced by name.
 
-Create `src/harness/agent.ts` exposing exactly four tools over the modules built in Tasks 2–8, using the API pinned in Step 1:
+Run TrueForge in **local mode** (`npx @truefoundry/trueforge`). Because MCP transport is remote-only, a hosted TrueForge could not reach a laptop-hosted MCP server without a tunnel, and spec §3 explicitly refuses tunnels.
+
+- [ ] **Step 2: Write the MCP server (NEW FILE — not in the original File Structure)**
+
+Create `src/mcp/server.ts`: a streamable-http MCP server exposing exactly four tools over the modules built in Tasks 2–8.
 
 | Tool | Backing module |
 |---|---|
 | `plan_cascade(changedPkg, targets)` | `scanRepos` → `affectedSubgraph` → `assertScoped` → `topoLevels` → `computeChangeset` |
-| `validate_changeset(entries)` | `buildWorkspaceRoot` → `validate` in the sandbox |
-| `launch_cascade(entries)` | `openChangesetPrs` → `armAll` (**gated behind the approval interrupt**) |
+| `validate_changeset(entries)` | `buildWorkspaceRoot` → `validate` (which calls `assertLinked`) |
+| `launch_cascade(entries)` | `openChangesetPrs` → `armAll` |
 | `cascade_status()` | `pollOnce` → `cascade.snapshot()` |
 
-`launch_cascade` must raise a TrueForge interrupt carrying the changeset and validation results, and must not proceed until resolved. That interrupt is Gate 1 from spec §6 and is the single most important line in the project.
+Keep this file thin: argument parsing, a call into the module, and JSON out. No orchestration logic lives here — that is what Tasks 2–8 are for.
 
-- [ ] **Step 3: Prepare the demo repos**
+- [ ] **Step 3: Wire the approval gate (one config line)**
+
+Gate 1 from spec §6 is **declarative**, not code. In the `AgentSpec` used to create the session:
+
+```ts
+mcpServers: [{
+  name: "chainreaction",
+  requireApprovalForTools: ["launch_cascade"],
+}]
+```
+
+`plan_cascade`, `validate_changeset`, and `cascade_status` are read-only and run unattended; `launch_cascade` is the only tool that opens PRs and arms auto-merge, so it is the only one that pauses. Do not add interrupt-handling code — TrueForge raises `tool.approval_required` on the turn stream and waits.
+
+The web app from Task 8 subscribes to `sessions.createTurnStream()`, renders the DAG when `tool.approval_required` arrives, and answers with a `user.tool_approval` turn input carrying the `toolCallId` from the event's `toolCalls[0].id`.
+
+- [ ] **Step 4: Prepare the demo repos**
 
 Add the `repository_dispatch` trigger (Task 6 Step 6) to the stubs in `design_system`, `mail_box_components`, `di_web`, `building_blocks`. Set `CR_DISPATCH_TOKEN` as an org secret. Enable auto-merge and branch protection on all five:
 
@@ -1541,7 +1593,7 @@ done
 
 Answering spec §12 Q1: wire Cloudflare Pages auto-deploy on merge to `main` for `sudobility`. If it resists, end the demo with a local `bun install && bun dev` — decide this before rehearsal, not during.
 
-- [ ] **Step 4: Rehearse against Verdaccio**
+- [ ] **Step 5: Rehearse against Verdaccio**
 
 ```bash
 bunx verdaccio --listen 4873
@@ -1549,17 +1601,17 @@ bunx verdaccio --listen 4873
 
 Point `.npmrc` at `http://localhost:4873`, run the full cascade end to end. Rehearsing against real npm burns public version numbers permanently.
 
-**Acceptance:** change the primary button color in `design_system`, approve once, and watch all five levels reach `published` with no further input.
+**Acceptance:** repoint `defaultTheme` in `design_system` at a visually distinct preset (`vaporwave`, `commodore-64`, `neo-brutalism`), approve once, and watch all five levels reach `published` with no further input. The landing page must repaint entirely although `sudobility`'s own diff contains nothing but a version bump.
 
-- [ ] **Step 5: Run live once, and record**
+- [ ] **Step 6: Run live once, and record**
 
 Switch to real npm, run the cascade, screen-record the DAG view alongside the landing page. Time-lapse to three minutes.
 
-- [ ] **Step 6: Write the README**
+- [ ] **Step 7: Write the README**
 
 Sections: what it does and the 59-repo problem statement; architecture diagram from spec §4; setup; the demo script; **"Qodo Code Review Evidence"** listing every merged PR and the Qodo feedback on it; a "Built with TrueForge" section naming sandbox, subagents, interrupts, and sessions and what each is load-bearing for.
 
-- [ ] **Step 7: Final commit and submission**
+- [ ] **Step 8: Final commit and submission**
 
 ```bash
 git checkout -b feat/harness-adapter
@@ -1572,14 +1624,16 @@ git push -u origin feat/harness-adapter && gh pr create --fill
 
 ## Cut List
 
-Budget is 21 hours against ~20 available (spec §10). Cut in this order:
+Budget is now **23 hours against ~20 available**. The original 21 assumed an in-process TrueForge
+adapter; Task 9's SDK probe found that impossible and added ~2h for `src/mcp/server.ts`
+(spec §10 for the original breakdown). Cut in this order:
 
 1. **Self-repair** — stall diagnosis narrows to "halt and report" (spec §7 already designates this the first cut)
 2. **Verdaccio rehearsal** — rehearse on two repos against real npm instead of five
 3. **Task 8 Step 4's animated states** — a static topological list with status badges still reads on video
 4. **Task 7's `detectStall`** — a manual refresh button replaces automatic stall detection
 
-**Never cut:** Task 1 (the spike), the Task 3 scoping guard, or Task 9 Steps 5–7. The last two hours belong to the video and README regardless of feature state.
+**Never cut:** Task 1 (the spike), the Task 3 scoping guard, the Task 4 `assertLinked` check, or Task 9 Steps 6–8. The last two hours belong to the video and README regardless of feature state.
 
 ---
 

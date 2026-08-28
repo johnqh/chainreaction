@@ -189,17 +189,33 @@ The payload is chosen to be *visible*, which is what makes this a demo rather th
 Chain (verified against the real graph):
 
 ```
-@sudobility/design      (design_system)          ← change primary button color
+@sudobility/design      (design_system)          ← repoint `defaultTheme` at another preset
    └→ @sudobility/components   (mail_box_components)
         └→ @sudobility/di_web
              └→ @sudobility/building_blocks
-                  └→ sudobility-landing (sudobility)   ← refresh, button is a different color
+                  └→ sudobility-landing (sudobility)   ← refresh, the whole page has changed palette
 ```
+
+**The payload is a theme swap, not a hex tweak.** `design_system` ships 46 theme presets
+(`src/themes/presets/`: `commodore-64`, `vaporwave`, `game-boy`, `neo-brutalism`, `dracula`, `nord`,
+`y2k`, …), and `sudobility/src/main.tsx` does:
+
+```ts
+import { configureTheme } from '@sudobility/design';
+import { defaultTheme, generateThemeCSS } from '@sudobility/design/themes';
+configureTheme(defaultTheme);
+```
+
+The app imports `defaultTheme` **by name** and pins no preset of its own. So a one-line change at the
+deepest upstream repaints the entire landing page while the app's own diff stays empty — which is
+exactly the claim being demonstrated. A single button changing hue is hard to see on video and easy
+to attribute to a cache; a whole-page palette transformation that provably required four publishes
+to arrive is not.
 
 Five levels. `building_blocks` pulls in 11 `@sudobility` packages, so the rendered graph is a real DAG,
 not a line.
 
-**Script:** change the primary button color in `design_system` → agent computes the affected set and
+**Script:** repoint `defaultTheme` in `design_system` → agent computes the affected set and
 validates all five repos in one sandbox → one Approve click → cascade runs live in the DAG view →
 refresh the landing page, the button has changed.
 
