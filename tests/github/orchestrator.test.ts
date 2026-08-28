@@ -36,6 +36,11 @@ test("PR body names the version bump and the upstream cause", async () => {
     .join(" ");
   expect(body).toContain("5.3.13 -> 5.3.14");
   expect(body).toContain("@sudobility/design");
+
+  // Verify root entry (empty depBumps) renders cascade root message
+  const rootBody = calls.find((c) => c.includes("create") && c.join(" ").includes("design_system"))!
+    .join(" ");
+  expect(rootBody).toContain("This is the root of the cascade.");
 });
 
 test("armAll approves before arming auto-merge, for every PR", async () => {
@@ -50,4 +55,20 @@ test("armAll approves before arming auto-merge, for every PR", async () => {
 test("prState parses the gh JSON response", async () => {
   const gh = new GhClient(async () => JSON.stringify({ state: "OPEN" }));
   expect(await gh.prState("johnqh/design_system", 7)).toBe("OPEN");
+});
+
+test("openPr throws when gh output contains no PR pattern", async () => {
+  const gh = new GhClient(async () => "something went wrong\n");
+  expect(async () => {
+    await gh.openPr("johnqh/design_system", "test-branch", "title", "body");
+  }).toThrow();
+});
+
+test("armAll throws when prs map is missing an entry's repo", async () => {
+  const { exec } = recorder();
+  const prs = new Map([["johnqh/design_system", 7]]);
+  const gh = new GhClient(exec);
+  expect(async () => {
+    await armAll(prs, entries, gh);
+  }).toThrow(/no PR found for johnqh\/mail_box_components/);
 });
