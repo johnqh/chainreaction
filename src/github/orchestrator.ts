@@ -39,7 +39,6 @@ export async function armAll(
     if (pr === undefined) {
       throw new Error(`no PR found for ${entry.repo}, cannot arm cascade`);
     }
-    await gh.approve(entry.repo, pr);
     await gh.armAutoMerge(entry.repo, pr);
   }
 }
