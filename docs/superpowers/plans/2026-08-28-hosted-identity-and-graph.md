@@ -43,9 +43,13 @@ Plan A is a hard prerequisite for both. Neither can be started without installat
 
 ---
 
-### Task 1: SPIKE — prove the App can read a private repo (do this first)
+### Task 1: Register and install the GitHub App (do this first)
 
-Everything in this plan and both later plans rests on installation tokens working. If an installation token cannot read a private repo's `package.json`, the product cannot see a customer's graph and the architecture is wrong. Find out now.
+Not a gate — a prerequisite. Tasks 2 and 3 need a real App ID, a private key, and an installation to code against, and only a human can create those in a browser.
+
+Private-repo reading is recorded here as an **observation, not an acceptance criterion**. It is expected to work: installation permissions are granted per-repo regardless of visibility, which is a principal reason to use an App rather than an OAuth token. If it turns out not to, that narrows the product to public repos rather than stopping this plan — note it and carry on.
+
+The genuinely measured private-repo limitation is a different one, already handled: branch protection and rulesets both return 403 on a free-tier private repo, which is why the spec pairs auto-merge with a control-plane merge fallback (§3.2). Reading is not affected by that.
 
 **Files:**
 - Create: `docs/spike-app-auth.md`
@@ -131,7 +135,9 @@ CR_APP_ID=<the app id> bun spike.ts
 
 - [ ] **Step 4: Record findings**
 
-**Acceptance:** installations list, a token with an `expires_at` about an hour out, the installation's repos including the private one, and a **200** reading a private repo's `package.json`.
+**What must work** (Tasks 2 and 3 cannot be written without these): the installations list returns your installation, the token exchange returns an `expires_at` roughly an hour out, and `/installation/repositories` lists the selected repos.
+
+**What is merely observed:** the status of reading the *private* repo's `package.json`. A 200 means private repos are in scope. Anything else means the product launches public-only — record it, open an issue, and continue; nothing in this plan changes either way.
 
 Write `docs/spike-app-auth.md` recording: whether it worked, the token TTL, whether `accept: application/vnd.github.raw+json` returns raw bytes (vs base64-in-JSON, which changes Task 3's parsing), and what `/installation/repositories` pagination looks like. If a repo has **no** `package.json`, note the exact status so Task 3 handles it rather than crashing.
 
@@ -705,7 +711,7 @@ git push -u origin feat/plan-cascade
 
 Nothing here is optional — this plan is the foundation both later plans require. If time is short, cut from **Plan C** instead (repair subagent first, then graph visuals).
 
-**Never cut:** Task 1's spike, and Task 3's warn-on-unparseable-manifest. A repo that silently vanishes from a publish plan is indistinguishable from a repo with no dependents.
+**Never cut:** Task 1's App registration (nothing else can be written without it), and Task 3's warn-on-unparseable-manifest. A repo that silently vanishes from a publish plan is indistinguishable from a repo with no dependents.
 
 ---
 
