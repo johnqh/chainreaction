@@ -91,6 +91,7 @@ Permissions requested:
 | Actions | read & write | dispatch validation, re-run a waiting PR's checks |
 | Administration | write | **Prepare** sets branch protection and `allow_auto_merge` |
 | Metadata | read | mandatory |
+| ~~Workflows~~ | **not requested** | writing `.github/workflows/**` is 403 without it; we require the customer to add the validation workflow instead — see §3.2 |
 | Webhooks | — | `workflow_run`, `check_suite`, `pull_request`, `push` |
 
 The App identity also solves a bug the local design hit in practice: **GitHub refuses to let anyone
@@ -106,7 +107,26 @@ per repo that:
 
 1. Enables `allow_auto_merge` on the repository.
 2. Sets branch protection on the default branch requiring **status checks only, never reviews**.
-3. Installs nothing. No workflow file is added to the customer's repo.
+3. Verifies that `.github/workflows/chainreaction-validate.yml` exists on the default branch, and
+   shows the file to add when it does not.
+
+**Step 3 is manual by choice, and the choice is deliberate.** A GitHub App cannot write any path
+under `.github/workflows/` without the separate `Workflows: write` permission — measured against a
+real installation:
+
+```
+PUT contents cr-probe.txt                    -> 201 OK
+PUT contents .github/workflows/cr-probe.yml  -> 403 Resource not accessible by integration
+```
+
+We do not request that permission. It means *this app can modify your CI*, it applies to every repo
+in the installation rather than only prepared ones, and it is exactly the permission a team should
+hesitate over for a product whose job is touching their release pipeline. Not asking for it is a
+trust advantage; it can be added later as a convenience, but it cannot be un-asked.
+
+The cost is honest: adding a file per repo is real friction at 60 repos. Prepare mitigates it by
+showing the exact file and verifying it landed, so an unprepared repo is greyed out with a stated
+reason rather than silently stalling a cascade at level 3.
 
 Making the precondition explicit and gating participation on it converts an invisible failure into a
 visible one — a repo that was never prepared is greyed out with a reason, rather than silently
@@ -143,7 +163,51 @@ got.
 
 ### 3.3 Validation in customer CI
 
-`validate_changeset` dispatches one workflow run into a chosen repo in the installation. That job:
+`validate_changeset` dispatches `chainreaction-validate.yml` — the workflow the customer added during
+Prepare — via `workflow_dispatch` in one repo of the installation. GitHub requires a dispatchable
+workflow to exist on the default branch, which is why Prepare verifies it rather than assuming it.
+
+**The workflow holds no credentials.** It authenticates to the control plane with a GitHub Actions
+**OIDC token**, which is signed by GitHub and carries verifiable `repository` and `repository_owner`
+claims. The control plane validates it against GitHub's JWKS and returns a short-lived installation
+token scoped to the affected repos, along with the changeset. Nothing is stored in the customer's
+secrets, and nothing sensitive appears in a workflow input or a log line.
+
+```yaml
+name: ChainReaction Validate
+on:
+  workflow_dispatch:
+    inputs:
+      cascade_id: { required: true, type: string }
+
+permissions:
+  id-token: write   # request the OIDC token
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: oven-sh/setup-bun@v2
+      - name: Exchange OIDC token for a scoped checkout token
+        id: auth
+        run: |
+          OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=chainreaction" | jq -r .value)
+          curl -sS -X POST "$CR_URL/api/ci/claim" \
+            -H "authorization: Bearer $OIDC" \
+            -d "{\"cascade_id\":\"${{ inputs.cascade_id }}\"}" -o /tmp/cr.json
+        env:
+          CR_URL: https://chainreaction.dev
+      - name: Assemble the workspace and validate
+        run: bunx @chainreaction/validate /tmp/cr.json
+```
+
+The heavy lifting lives in a published `@chainreaction/validate` package rather than inline YAML, so
+the file customers paste stays short enough to read and audit, and fixes ship without asking 60 repos
+to update a workflow.
+
+That job:
 
 1. Checks out every repo in the affected set using an installation token.
 2. Writes a private workspace root listing them all as members.
