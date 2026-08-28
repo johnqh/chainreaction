@@ -31,7 +31,7 @@ test("scanRepos maps package names to repo nodes and @sudobility deps only", () 
   const g = scanRepos(fixture());
   expect(g.size).toBe(5);
   const components = g.get("@sudobility/components")!;
-  expect(components.dir.endsWith("mail_box_components")).toBe(true);
+  expect(components.dir!.endsWith("mail_box_components")).toBe(true);
   expect(components.repo).toBe("johnqh/mail_box_components");
   expect(components.version).toBe("5.3.13");
   expect(components.deps).toEqual(["@sudobility/design"]);
