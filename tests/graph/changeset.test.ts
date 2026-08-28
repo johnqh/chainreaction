@@ -36,12 +36,18 @@ test("assertScoped rejects an unscoped run over a large affected set", () => {
   expect(() => assertScoped(affected, [])).toThrow(/explicit target set/i);
 });
 
-test("assertScoped allows an explicit target list or an explicit all", () => {
+test("assertScoped allows an explicit target list that exactly covers the affected set, or an explicit all", () => {
   const affected = new Set(["a", "b"]);
-  expect(() => assertScoped(affected, ["a"])).not.toThrow();
+  expect(() => assertScoped(affected, ["a", "b"])).not.toThrow();
   expect(() => assertScoped(affected, "all")).not.toThrow();
 });
 
 test("assertScoped rejects a target that is not in the affected set", () => {
   expect(() => assertScoped(new Set(["a"]), ["zzz"])).toThrow(/not in the affected set/i);
+});
+
+test("assertScoped rejects a strict subset of the affected set, naming what is missing", () => {
+  const affected = new Set(["a", "b", "c"]);
+  expect(() => assertScoped(affected, ["a"])).toThrow(/missing.*b.*c|missing.*c.*b/is);
+  expect(() => assertScoped(affected, ["a"])).toThrow(/"all"/);
 });

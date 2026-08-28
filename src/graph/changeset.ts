@@ -50,4 +50,13 @@ export function assertScoped(
   if (unknown.length > 0) {
     throw new Error(`not in the affected set: ${unknown.join(", ")}`);
   }
+  const targetSet = new Set(targets);
+  const missing = [...affected].filter((a) => !targetSet.has(a));
+  if (missing.length > 0) {
+    throw new Error(
+      `targets do not cover the full affected set, missing: ${missing.join(", ")}. ` +
+        `A partial cascade would leave downstream repos referencing versions that never publish. ` +
+        `Pass "all" to accept the whole set.`,
+    );
+  }
 }

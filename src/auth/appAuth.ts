@@ -74,11 +74,15 @@ export class TokenStore {
       // Never include the JWT or the key in the message.
       throw new Error(`installation token exchange failed: ${res.status}`);
     }
-    const body = (await res.json()) as { token: string; expires_at: string };
-    const minted: InstallationToken = {
-      token: body.token,
-      expiresAt: Math.floor(new Date(body.expires_at).getTime() / 1000),
-    };
+    const body = (await res.json()) as { token?: unknown; expires_at?: unknown };
+    if (typeof body.token !== "string" || body.token.length === 0) {
+      throw new Error("installation token exchange returned no token");
+    }
+    const expiresAt = Math.floor(new Date(String(body.expires_at)).getTime() / 1000);
+    if (!Number.isFinite(expiresAt)) {
+      throw new Error("installation token exchange returned an unparseable expires_at");
+    }
+    const minted: InstallationToken = { token: body.token, expiresAt };
     this.cache.set(installationId, minted);
     return minted.token;
   }

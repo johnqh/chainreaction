@@ -145,6 +145,24 @@ test("TokenStore de-duplicates concurrent requests for the same installation", a
   expect(calls).toBe(1);
 });
 
+test("TokenStore rejects a 2xx exchange body with no token, instead of caching undefined", async () => {
+  const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
+  const fetchFn = (async () =>
+    new Response(JSON.stringify({ expires_at: new Date(Date.now() + 3_600_000).toISOString() }),
+      { status: 201 })) as unknown as typeof fetch;
+  const store = new TokenStore(creds, fetchFn);
+  await expect(store.get(7)).rejects.toThrow(/no token/i);
+});
+
+test("TokenStore rejects a 2xx exchange body with an unparseable expires_at", async () => {
+  const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
+  const fetchFn = (async () =>
+    new Response(JSON.stringify({ token: "tok-1", expires_at: "not-a-date" }),
+      { status: 201 })) as unknown as typeof fetch;
+  const store = new TokenStore(creds, fetchFn);
+  await expect(store.get(7)).rejects.toThrow(/expires_at/i);
+});
+
 test("TokenStore retries after a failed exchange instead of caching the rejection", async () => {
   const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
   let calls = 0;
