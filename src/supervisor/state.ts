@@ -13,14 +13,22 @@ export interface CascadeSnapshot {
 
 export class Cascade {
   private states = new Map<string, NodeState>();
+  private lastChange = new Map<string, number>();
 
-  constructor(private entries: ChangesetEntry[]) {
-    for (const e of entries) this.states.set(e.pkg, "pending");
+  constructor(private entries: ChangesetEntry[], now = Date.now()) {
+    for (const e of entries) {
+      this.states.set(e.pkg, "pending");
+      this.lastChange.set(e.pkg, now);
+    }
   }
 
-  set(pkg: string, state: NodeState): void {
+  set(pkg: string, state: NodeState, now = Date.now()): void {
     if (!this.states.has(pkg)) throw new Error(`unknown package: ${pkg}`);
-    this.states.set(pkg, state);
+    const prev = this.states.get(pkg);
+    if (prev !== state) {
+      this.states.set(pkg, state);
+      this.lastChange.set(pkg, now);
+    }
   }
 
   get(pkg: string): NodeState {
@@ -49,18 +57,26 @@ export class Cascade {
     );
     return { nodes, edges };
   }
+
+  getPackageNames(): string[] {
+    return [...this.states.keys()];
+  }
+
+  getLastChangeTime(pkg: string): number {
+    const t = this.lastChange.get(pkg);
+    if (t === undefined) throw new Error(`unknown package: ${pkg}`);
+    return t;
+  }
 }
 
 export function detectStall(
   cascade: Cascade,
   now: number,
-  lastChange: Map<string, number>,
   timeoutMs: number,
 ): string[] {
-  return [...lastChange.entries()]
-    .filter(([pkg, at]) => {
+  return cascade.getPackageNames()
+    .filter((pkg) => {
       const state = cascade.get(pkg);
-      return !TERMINAL.includes(state) && now - at > timeoutMs;
-    })
-    .map(([pkg]) => pkg);
+      return !TERMINAL.includes(state) && now - cascade.getLastChangeTime(pkg) > timeoutMs;
+    });
 }
