@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { InstallationGitHubApi } from "../../src/github/installationApi";
+import { InstallationGitHubApi, parseNextLink } from "../../src/github/installationApi";
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -107,4 +107,27 @@ test("never logs the token", async () => {
     console.log = originalLog;
   }
   expect(warnings.some((w) => w.includes("super-secret-token"))).toBe(false);
+});
+
+test("parseNextLink picks rel=next from a multi-relation header", () => {
+  const header =
+    '<https://api.github.com/installation/repositories?page=1>; rel="prev", ' +
+    '<https://api.github.com/installation/repositories?page=3>; rel="next", ' +
+    '<https://api.github.com/installation/repositories?page=5>; rel="last"';
+  expect(parseNextLink(header)).toBe(
+    "https://api.github.com/installation/repositories?page=3",
+  );
+});
+
+test("parseNextLink returns null for a null header", () => {
+  expect(parseNextLink(null)).toBeNull();
+});
+
+test("parseNextLink returns null when there is no rel=next, even with other relations present", () => {
+  const header =
+    '<https://api.github.com/installation/repositories?page=4>; rel="prev", ' +
+    '<https://api.github.com/installation/repositories?page=5>; rel="last"';
+  // If this ever returned a URL, listRepos would never terminate its
+  // pagination loop.
+  expect(parseNextLink(header)).toBeNull();
 });
