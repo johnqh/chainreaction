@@ -16,8 +16,13 @@ export function scanRepos(root: string): Map<string, RepoNode> {
     let pkg: any;
     try {
       pkg = JSON.parse(readFileSync(manifest, "utf8"));
-    } catch {
-      continue; // an unparseable manifest is not a graph node
+    } catch (err) {
+      // An unparseable manifest is not a graph node, but dropping a repo out
+      // of the publish plan silently would be indistinguishable from "this
+      // repo has no dependents" — warn so the gap is visible.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`scanRepos: skipping unparseable manifest ${manifest}: ${reason}`);
+      continue;
     }
     if (!pkg?.name) continue;
 
