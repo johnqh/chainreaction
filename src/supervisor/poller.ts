@@ -16,7 +16,12 @@ export async function pollOnce(
     if (pr === undefined) continue;
 
     const ghState = await gh.prState(entry.repo, pr);
-    const next: NodeState = ghState === "MERGED" ? "merged" : "ci-running";
+    if (cascade.get(entry.pkg) === "stalled" && ghState !== "MERGED") continue;
+
+    const next: NodeState =
+      ghState === "MERGED" ? "merged" :
+      ghState === "CLOSED" ? "stalled" :
+      "ci-running";
     cascade.set(entry.pkg, next, now);
   }
   for (const pkg of detectStall(cascade, now, STALL_TIMEOUT_MS)) {

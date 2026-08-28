@@ -1,8 +1,5 @@
 import { useEffect, useState } from "react";
-
-type NodeState =
-  | "pending" | "validated" | "pr-open" | "ci-running"
-  | "merged" | "published" | "stalled";
+import type { NodeState } from "../supervisor/state";
 
 interface Snapshot {
   nodes: { pkg: string; repo: string; level: number; version: string; state: NodeState }[];
@@ -17,11 +14,23 @@ const COLOR: Record<NodeState, string> = {
 export function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [approved, setApproved] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
 
   useEffect(() => {
-    const es = new EventSource("/api/state");
-    es.onmessage = (e) => setSnap(JSON.parse(e.data));
-    return () => es.close();
+    let es: EventSource | undefined;
+    let cancelled = false;
+    fetch("/api/token")
+      .then((r) => r.json())
+      .then((data: { token: string }) => {
+        if (cancelled) return;
+        setToken(data.token);
+        es = new EventSource(`/api/state?token=${encodeURIComponent(data.token)}`);
+        es.onmessage = (e) => setSnap(JSON.parse(e.data));
+      });
+    return () => {
+      cancelled = true;
+      es?.close();
+    };
   }, []);
 
   if (!snap) return <div style={{ padding: 32, color: "#eee" }}>connecting…</div>;
@@ -40,7 +49,14 @@ export function App() {
 
       {!approved && (
         <button
-          onClick={() => { fetch("/api/approve", { method: "POST" }); setApproved(true); }}
+          onClick={() => {
+            if (!token) return;
+            fetch("/api/approve", {
+              method: "POST",
+              headers: { "X-ChainReaction-Token": token },
+            });
+            setApproved(true);
+          }}
           style={{ background: "#2f855a", color: "#fff", border: 0, padding: "12px 24px",
                    fontSize: 16, borderRadius: 6, cursor: "pointer", marginBottom: 32 }}
         >
