@@ -1,6 +1,6 @@
 export interface RepoNode {
   pkg: string;
-  dir: string;
+  dir?: string;
   repo: string;
   version: string;
   deps: string[];
@@ -8,7 +8,7 @@ export interface RepoNode {
 
 export interface ChangesetEntry {
   pkg: string;
-  dir: string;
+  dir?: string;
   repo: string;
   fromVersion: string;
   toVersion: string;
