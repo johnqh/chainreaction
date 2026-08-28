@@ -1,8 +1,12 @@
-// GitHub downloads App keys as PKCS#1 (-----BEGIN RSA PRIVATE KEY-----), but
-// crypto.subtle.importKey supports only pkcs8/spki/raw/jwk — there is no "pkcs1".
-// Feeding it PKCS#1 throws `DataError`. Measured against a real App key; see
-// docs/spike-app-auth.md. A product cannot ask customers to run openssl, so we wrap
-// the PKCS#1 body in the fixed PKCS#8 envelope. No key parsing is needed.
+// GitHub issues App private keys as PKCS#1 (-----BEGIN RSA PRIVATE KEY-----),
+// but crypto.subtle.importKey supports only the "pkcs8", "spki", "raw", and
+// "jwk" formats — there is no "pkcs1". Feeding it PKCS#1 DER throws
+// `DataError`. A product cannot ask customers to run openssl, so instead we
+// wrap the PKCS#1 RSAPrivateKey in the fixed RFC 5208 PKCS#8 envelope
+// (version INTEGER, rsaEncryption AlgorithmIdentifier, then the PKCS#1 body
+// as an OCTET STRING) before handing it to importKey. Because the envelope
+// around an RSA key is always this same fixed shape, no key parsing is
+// needed — we only need to wrap the existing bytes, not interpret them.
 
 function derLength(n: number): number[] {
   if (n < 0x80) return [n];

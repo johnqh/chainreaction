@@ -64,6 +64,55 @@ test("the scope is a parameter — a different scope yields no edges", async () 
   expect(g.get("@acme/components")!.deps).toEqual([]);
 });
 
+test("refuses a graph where two repos declare the same package name", async () => {
+  const dupeRepos: RepoRef[] = [
+    { fullName: "acme/design_system", private: false, defaultBranch: "main" },
+    { fullName: "acme/design_system_fork", private: false, defaultBranch: "main" },
+  ];
+  const dupeApi: GitHubApi = {
+    listRepos: async () => dupeRepos,
+    getManifest: async (fullName) =>
+      JSON.stringify({ name: "@acme/design", version: fullName === "acme/design_system" ? "1.1.49" : "0.9.0" }),
+  };
+  let message = "";
+  try {
+    await new GitHubGraphSource(dupeApi, "@acme/").load();
+  } catch (e) {
+    message = (e as Error).message;
+  }
+  expect(message).toContain("acme/design_system");
+  expect(message).toContain("acme/design_system_fork");
+});
+
+test("a graph with one unparseable and one nameless manifest reports two skipped entries naming both repos", async () => {
+  const repos: RepoRef[] = [
+    { fullName: "acme/broken", private: false, defaultBranch: "main" },
+    { fullName: "acme/nameless", private: false, defaultBranch: "main" },
+    { fullName: "acme/design_system", private: false, defaultBranch: "main" },
+  ];
+  const manifests: Record<string, string> = {
+    "acme/broken": "{ this is not json",
+    "acme/nameless": JSON.stringify({ version: "1.0.0" }),
+    "acme/design_system": JSON.stringify({ name: "@acme/design", version: "1.1.49" }),
+  };
+  const source = new GitHubGraphSource(
+    { listRepos: async () => repos, getManifest: async (f) => manifests[f] ?? null },
+    "@acme/",
+  );
+  const original = console.error;
+  console.error = () => {};
+  try { await source.load(); } finally { console.error = original; }
+
+  expect(source.skipped.length).toBe(2);
+  expect(source.skipped.map((s) => s.repo).sort()).toEqual(["acme/broken", "acme/nameless"]);
+});
+
+test("a repo with no package.json (raw === null) produces no skipped entry", async () => {
+  const source = new GitHubGraphSource(api(), "@acme/");
+  await source.load();
+  expect(source.skipped.some((s) => s.repo === "acme/no-manifest")).toBe(false);
+});
+
 test("one manifest request per repo, no duplicates", async () => {
   const a = api();
   await new GitHubGraphSource(a, "@acme/").load();

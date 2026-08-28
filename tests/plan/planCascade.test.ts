@@ -38,6 +38,31 @@ test("rejects a target outside the affected set", async () => {
   await expect(planCascade(source, "@acme/design", ["@acme/unrelated"])).rejects.toThrow(/not in the affected set/i);
 });
 
+test("an explicit target set that exactly covers the affected set passes", async () => {
+  const plan = await planCascade(source, "@acme/design", ["@acme/design", "@acme/components", "acme-app"]);
+  expect(plan.affected.sort()).toEqual(["@acme/components", "@acme/design", "acme-app"]);
+});
+
+test("a strict subset of the affected set is rejected, naming what is missing", async () => {
+  await expect(planCascade(source, "@acme/design", ["@acme/design"])).rejects.toThrow(
+    /missing.*@acme\/components.*acme-app|missing.*acme-app.*@acme\/components/is,
+  );
+});
+
 test("throws when the changed package is not in the graph", async () => {
   await expect(planCascade(source, "@acme/ghost", "all")).rejects.toThrow(/not in the graph/i);
+});
+
+test("a plain GraphSource with no skipped property defaults to an empty skipped list", async () => {
+  const plan = await planCascade(source, "@acme/design", "all");
+  expect(plan.skipped).toEqual([]);
+});
+
+test("a source exposing skipped repos has them surfaced on the plan", async () => {
+  const skippedSource: GraphSource & { skipped: { repo: string; reason: string }[] } = {
+    load: source.load,
+    skipped: [{ repo: "acme/broken", reason: "unparseable manifest: boom" }],
+  };
+  const plan = await planCascade(skippedSource, "@acme/design", "all");
+  expect(plan.skipped).toEqual([{ repo: "acme/broken", reason: "unparseable manifest: boom" }]);
 });

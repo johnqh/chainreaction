@@ -1,5 +1,6 @@
 import type { GraphSource } from "../graph/source";
 import type { ChangesetEntry } from "../graph/types";
+import type { SkippedRepo } from "../graph/githubSource";
 import { affectedSubgraph, topoLevels } from "../graph/resolver";
 import { assertScoped, computeChangeset } from "../graph/changeset";
 
@@ -8,6 +9,7 @@ export interface CascadePlan {
   affected: string[];
   levels: string[][];
   changeset: ChangesetEntry[];
+  skipped: SkippedRepo[];
 }
 
 export async function planCascade(
@@ -25,10 +27,18 @@ export async function planCascade(
   assertScoped(affected, targets);
 
   const levels = topoLevels(graph, affected);
+  // Feature-detect: only a source that tracks skipped repos (e.g.
+  // GitHubGraphSource) exposes this. FilesystemGraphSource and test doubles
+  // that satisfy plain GraphSource still work, and just report none skipped.
+  const skipped: SkippedRepo[] =
+    "skipped" in source && Array.isArray((source as { skipped: unknown }).skipped)
+      ? (source as { skipped: SkippedRepo[] }).skipped
+      : [];
   return {
     changed,
     affected: [...affected].sort(),
     levels,
     changeset: computeChangeset(graph, levels),
+    skipped,
   };
 }

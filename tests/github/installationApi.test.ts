@@ -92,6 +92,22 @@ test("getManifest sends the raw accept header and returns raw JSON text, not bas
   expect(() => JSON.parse(manifest!)).not.toThrow();
 });
 
+test("listRepos throws when the response has no repositories array", async () => {
+  const fetchFn = (async () => jsonResponse({ total_count: 0 })) as unknown as typeof fetch;
+  const api = new InstallationGitHubApi(async () => "token-123", 42, fetchFn);
+  await expect(api.listRepos()).rejects.toThrow(/repositories/i);
+});
+
+test("listRepos throws when a repository entry has no full_name", async () => {
+  const fetchFn = (async () =>
+    jsonResponse({
+      total_count: 1,
+      repositories: [{ private: false, default_branch: "main" }],
+    })) as unknown as typeof fetch;
+  const api = new InstallationGitHubApi(async () => "token-123", 42, fetchFn);
+  await expect(api.listRepos()).rejects.toThrow(/full_name/i);
+});
+
 test("never logs the token", async () => {
   const warnings: string[] = [];
   const originalError = console.error;

@@ -54,8 +54,14 @@ export class InstallationGitHubApi implements GitHubApi {
       if (!res.ok) {
         throw new Error(`listRepos failed: ${res.status} ${res.statusText}`);
       }
-      const body = (await res.json()) as RawListReposResponse;
+      const body = (await res.json()) as Partial<RawListReposResponse>;
+      if (!Array.isArray(body.repositories)) {
+        throw new Error("listRepos response is missing a repositories array");
+      }
       for (const r of body.repositories) {
+        if (typeof r.full_name !== "string" || r.full_name.length === 0) {
+          throw new Error("listRepos response contains a repository with no full_name");
+        }
         repos.push({ fullName: r.full_name, private: r.private, defaultBranch: r.default_branch });
       }
       // Follow the Link header, never a count computed from total_count —
