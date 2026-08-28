@@ -1106,9 +1106,11 @@ In `/Users/johnhuang/projects/workflows/.github/workflows/unified-cicd.yml`, ins
 
 `continue-on-error: true` is deliberate: a cascade notification failure must never break an ordinary release for the other ~100 repos that are not part of a cascade. The `.chainreaction.json` guard is what keeps this inert outside a cascade — the orchestrator writes that file into each PR branch and it never reaches `main`.
 
-- [ ] **Step 6: Add the receiving trigger**
+- [ ] **Step 6: Add the receiving trigger — re-run path (CONFIRMED REQUIRED)**
 
-In the same file, extend the `on:` block of the reusable workflow's caller contract. Because callers use `workflow_call`, the `repository_dispatch` trigger must live in each repo's **stub**. Add to the stub template that Task 9 documents, and to the five demo repos now:
+The Task 1 spike settled this empirically: a `repository_dispatch` run carries **no PR association**. Its check attaches to `main`'s SHA, never the PR head, so the waiting PR stays red and auto-merge never fires. Measured on `johnqh/cr-spike-b`: the dispatch run *succeeded* on `main` while the PR check remained `FAILURE`. The re-run path is the design, not a contingency. See `docs/spike-findings.md` §1.
+
+Because callers use `workflow_call`, the `repository_dispatch` trigger must live in each repo's **stub**, not in `unified-cicd.yml`. Add to the five demo repos now, and to the stub template Task 9 documents:
 
 ```yaml
 on:
@@ -1118,9 +1120,54 @@ on:
     branches: [main, develop]
   repository_dispatch:
     types: [upstream-published]
+
+jobs:
+  cicd:
+    if: github.event_name != 'repository_dispatch'
+    uses: johnqh/workflows/.github/workflows/unified-cicd.yml@main
+    with:
+      npm-access: "public"
+    secrets: inherit
+
+  cascade_rerun:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the upstream version to be resolvable on npm
+        env:
+          PKG: ${{ github.event.client_payload.package }}
+          VER: ${{ github.event.client_payload.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if npm view "$PKG@$VER" version >/dev/null 2>&1; then
+              echo "resolvable after $((i*10))s"; exit 0
+            fi
+            echo "waiting for $PKG@$VER ($((i*10))s)"; sleep 10
+          done
+          echo "::error::$PKG@$VER never became resolvable"; exit 1
+
+      - name: Re-run the waiting PR's own failed checks
+        env:
+          GH_TOKEN: ${{ secrets.CR_DISPATCH_TOKEN }}
+          BRANCH: ${{ github.event.client_payload.branch }}
+        run: |
+          RUN_ID=$(gh run list -R "${{ github.repository }}" \
+            --branch "$BRANCH" --event pull_request \
+            --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::no pull_request run found for $BRANCH"; exit 1
+          fi
+          gh run rerun "$RUN_ID" --failed
 ```
 
-Then add the re-run step from Task 1 Step 7 if the spike showed dispatch does not satisfy the PR check directly.
+**The wait step is not optional, and its placement is the point.** `unified-cicd.yml`'s existing `check-npm-version` step compares the local version against `npm view <pkg> version` only to decide whether to publish — it is an idempotency guard, **not** a propagation wait, and nothing else in that pipeline waits for anything. If the rerun fires before the upstream version is resolvable, the downstream `bun install` fails against a version that does not exist yet, the PR goes red for a reason unrelated to the change, and the cascade stalls on the exact race this design exists to eliminate. Waiting *before* triggering the rerun means the rerun only ever starts against an installable dependency.
+
+Both failure paths `exit 1`, never `exit 0`. A cascade that cannot proceed must fail loudly: a silent success here produces a stalled chain that looks healthy, which is the worst failure mode in this system.
+
+Two further consequences of the spike, both binding:
+
+- `client_payload` must carry `branch`, `package`, and `version`. The sender in Step 5 already sends all three; without `branch` the handler cannot find the run, and without `package`/`version` it cannot wait.
+- `CR_DISPATCH_TOKEN` needs **`actions: write`** in addition to `contents: write`. A `contents`-only token fires the dispatch and then silently fails to re-run anything.
 
 - [ ] **Step 7: Verify on the spike repos, then commit**
 
