@@ -66,10 +66,20 @@ export function createInstallationApiFactory(
 
 export interface ApiDeps {
   apisFor: InstallationApiFactory;
-  /** The npm scope this installation manages — same meaning as `CliConfig.scope`. */
-  scope: string;
-  /** Same meaning as `CliConfig.requiredChecks` — passed straight to `assessRepo`. */
-  requiredChecks: string[];
+  /**
+   * The npm scope a given installation manages — same meaning as
+   * `CliConfig.scope`, but keyed per installation rather than a single
+   * server-wide value: two installations can manage packages under
+   * different scopes, and a scope wrong for a given installation doesn't
+   * fail loudly — `GitHubGraphSource` just excludes every dependency edge,
+   * producing an empty-looking graph that reads as a legitimate answer.
+   * The entrypoint may return the same value for every installation today;
+   * what matters is that the shape doesn't foreclose per-installation
+   * configuration later.
+   */
+  scopeFor: (installationId: number) => string | Promise<string>;
+  /** Same meaning as `CliConfig.requiredChecks`, keyed per installation for the same reason as `scopeFor`. */
+  requiredChecksFor: (installationId: number) => string[] | Promise<string[]>;
   /**
    * Whether `entry.toVersion` is currently resolvable, for the Auto Merge
    * train. Defaults to a real npm registry lookup. Overridden in tests so no
@@ -230,13 +240,15 @@ async function ownedRepos(apis: InstallationApis): Promise<Map<string, RepoRef>>
 
 // --- route handlers ------------------------------------------------------------
 
-async function handleRepos(apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handleRepos(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
   let repos: RepoRef[];
   try {
     repos = await apis.githubApi.listRepos();
   } catch (err) {
     return errorResponse(err, 502);
   }
+
+  const requiredChecks = await deps.requiredChecksFor(installationId);
 
   const results: { name: string; private: boolean; prepared: PrepareResult }[] = [];
   // Serial loop, deliberately: assessRepo issues 6+ requests per repo, and a
@@ -246,7 +258,7 @@ async function handleRepos(apis: InstallationApis, deps: ApiDeps): Promise<Respo
   for (const repo of repos) {
     let prepared: PrepareResult;
     try {
-      prepared = await assessRepo(apis.adminApi, repo.fullName, deps.requiredChecks);
+      prepared = await assessRepo(apis.adminApi, repo.fullName, requiredChecks);
     } catch (err) {
       prepared = {
         repo: repo.fullName,
@@ -260,8 +272,9 @@ async function handleRepos(apis: InstallationApis, deps: ApiDeps): Promise<Respo
   return jsonResponse({ repos: results });
 }
 
-async function handleGraph(apis: InstallationApis, deps: ApiDeps): Promise<Response> {
-  const source = new GitHubGraphSource(apis.githubApi, deps.scope);
+async function handleGraph(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
+  const scope = await deps.scopeFor(installationId);
+  const source = new GitHubGraphSource(apis.githubApi, scope);
   let graph: Map<string, RepoNode>;
   try {
     graph = await source.load();
@@ -273,14 +286,20 @@ async function handleGraph(apis: InstallationApis, deps: ApiDeps): Promise<Respo
   return jsonResponse({ nodes, edges, skipped: source.skipped });
 }
 
-async function handleUpdate(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handleUpdate(
+  req: Request,
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseUpdateBody(raw);
   if (!body) {
     return jsonResponse({ error: 'expected { pkg: string, mode: "one" | "chain" }' }, 400);
   }
 
-  const source = new GitHubGraphSource(apis.githubApi, deps.scope);
+  const scope = await deps.scopeFor(installationId);
+  const source = new GitHubGraphSource(apis.githubApi, scope);
   let graph: Map<string, RepoNode>;
   try {
     graph = await source.load();
@@ -462,6 +481,24 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
         await apis.prApi.mergePr(entry.repo, pr);
         return true;
       } catch {
+        // A rejected mergePr can mean the merge genuinely failed, or that
+        // this exact PR was already merged — e.g. a client retry after a
+        // gateway timeout re-issuing a call whose original attempt actually
+        // succeeded (mergePr can take longer than common gateway idle
+        // timeouts under this route's default poll settings). GitHub
+        // rejects a second merge attempt on an already-merged PR, and
+        // reporting that as a stall would tell the user the chain broke
+        // when the step in question actually completed. Re-check the PR's
+        // own state before giving up — only a genuine, still-open PR is a
+        // real failure.
+        try {
+          const state = await apis.prApi.prState(entry.repo, pr);
+          if (state === "MERGED") return true;
+        } catch {
+          // Could not even check state — fall through to reporting the
+          // original failure; this is a second chance, not a replacement
+          // for a meaningful error.
+        }
         return false;
       }
     },
@@ -514,9 +551,11 @@ export async function handleApiRequest(
   // this line reads an installation id from the request itself.
   const apis = deps.apisFor(session.installationId);
 
-  if (url.pathname === "/api/repos" && req.method === "GET") return handleRepos(apis, deps);
-  if (url.pathname === "/api/graph" && req.method === "GET") return handleGraph(apis, deps);
-  if (url.pathname === "/api/update" && req.method === "POST") return handleUpdate(req, apis, deps);
+  if (url.pathname === "/api/repos" && req.method === "GET") return handleRepos(apis, deps, session.installationId);
+  if (url.pathname === "/api/graph" && req.method === "GET") return handleGraph(apis, deps, session.installationId);
+  if (url.pathname === "/api/update" && req.method === "POST") {
+    return handleUpdate(req, apis, deps, session.installationId);
+  }
   if (url.pathname === "/api/prs" && req.method === "POST") return handlePrs(req, apis, deps);
   if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps);
   if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps);

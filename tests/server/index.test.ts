@@ -568,7 +568,7 @@ test("a hosted API route is scoped to the signed-in session's installation, end 
   })();
 
   const deps = makeDeps({
-    api: { apisFor: factory, scope: "@acme/", requiredChecks: [] },
+    api: { apisFor: factory, scopeFor: () => "@acme/", requiredChecksFor: () => [] },
   });
 
   await withServer(deps, async (baseUrl) => {

@@ -51,9 +51,15 @@ function fakeAdminApi(): RepoAdminApi {
   };
 }
 
-function fakePrApi(opts: { mergeShouldFail?: boolean } = {}): { api: PrApi; calls: string[] } {
+function fakePrApi(opts: {
+  mergeShouldFail?: boolean;
+  /** mergePr rejects for this exact repo/pr, but prState reports it already MERGED. */
+  alreadyMerged?: { repo: string; pr: number };
+} = {}): { api: PrApi; calls: string[] } {
   const calls: string[] = [];
   let nextPr = 100;
+  const isAlreadyMerged = (full: string, pr: number) =>
+    opts.alreadyMerged?.repo === full && opts.alreadyMerged?.pr === pr;
   const api: PrApi = {
     defaultBranchSha: async (full, branch) => {
       calls.push(`defaultBranchSha:${full}:${branch}`);
@@ -71,9 +77,14 @@ function fakePrApi(opts: { mergeShouldFail?: boolean } = {}): { api: PrApi; call
     },
     mergePr: async (full, pr) => {
       calls.push(`mergePr:${full}:${pr}`);
-      if (opts.mergeShouldFail) throw new Error(`mergePr ${full}#${pr} failed: 405`);
+      if (opts.mergeShouldFail || isAlreadyMerged(full, pr)) {
+        throw new Error(`mergePr ${full}#${pr} failed: 405`);
+      }
     },
-    prState: async () => "OPEN",
+    prState: async (full, pr) => {
+      calls.push(`prState:${full}:${pr}`);
+      return isAlreadyMerged(full, pr) ? "MERGED" : "OPEN";
+    },
   };
   return { api, calls };
 }
@@ -99,8 +110,8 @@ function baseDeps(over: Partial<ApiDeps> = {}): ApiDeps {
   const { factory } = factoryFor(makeApis());
   return {
     apisFor: factory,
-    scope: "@acme/",
-    requiredChecks: ["ci"],
+    scopeFor: () => "@acme/",
+    requiredChecksFor: () => ["ci"],
     isResolvable: async () => true,
     sleep: async () => {},
     ...over,
@@ -453,4 +464,166 @@ test("POST /api/train rejects a malformed body", async () => {
   const deps = baseDeps();
   const res = await call("/api/train", deps, session(), { method: "POST", body: JSON.stringify({ entries: [] }) });
   expect(res.status).toBe(400);
+});
+
+// --- Fix-round: scopeFor/requiredChecksFor are looked up per installation ------
+
+test("GET /api/repos resolves requiredChecks via requiredChecksFor(installationId), not a single server-wide value", async () => {
+  const seenIds: number[] = [];
+  const deps = baseDeps({
+    requiredChecksFor: (installationId) => {
+      seenIds.push(installationId);
+      return ["ci"];
+    },
+  });
+  const res = await call("/api/repos", deps, session(77));
+  expect(res.status).toBe(200);
+  expect(seenIds).toEqual([77]);
+});
+
+test("GET /api/graph resolves scope via scopeFor(installationId), and a wrong scope silently empties the graph (not an error) — proving the lookup is actually used", async () => {
+  const deps = baseDeps({ scopeFor: () => "@other-tenant/" });
+  const res = await call("/api/graph", deps, session());
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { nodes: unknown[]; edges: unknown[] };
+  // @acme/* packages exist, but "@other-tenant/" filters out every deps/devDeps
+  // edge — this is exactly the failure mode Important-3 named, reproduced
+  // here to prove scopeFor's return value actually reaches GitHubGraphSource.
+  expect(body.nodes).toHaveLength(2);
+  expect(body.edges).toEqual([]);
+});
+
+test("GET /api/graph passes the session's own installationId to scopeFor, not a fixed/wrong one", async () => {
+  const seenIds: number[] = [];
+  const deps = baseDeps({
+    scopeFor: (installationId) => {
+      seenIds.push(installationId);
+      return "@acme/";
+    },
+  });
+  const res = await call("/api/graph", deps, session(91));
+  expect(res.status).toBe(200);
+  expect(seenIds).toEqual([91]);
+});
+
+test("POST /api/update resolves scope via scopeFor(installationId)", async () => {
+  const seenIds: number[] = [];
+  const deps = baseDeps({
+    scopeFor: (installationId) => {
+      seenIds.push(installationId);
+      return "@acme/";
+    },
+  });
+  const res = await call("/api/update", deps, session(13), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/components", mode: "one" }),
+  });
+  expect(res.status).toBe(200);
+  expect(seenIds).toEqual([13]);
+});
+
+// --- Fix-round: /api/update must surface skipped repos, not just /api/graph ----
+
+test("POST /api/update surfaces skipped repos from the graph load, same as /api/graph", async () => {
+  const { api: github } = fakeGitHubApi({
+    repos: [
+      { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+      { fullName: "acme/components", private: true, defaultBranch: "trunk" },
+      { fullName: "acme/broken", private: false, defaultBranch: "trunk" },
+    ],
+    manifests: {
+      "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        dependencies: { "@acme/design": "^1.0.0" },
+      }),
+      "acme/broken": "not json",
+    },
+  });
+  const { factory } = factoryFor(makeApis({ github }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const res = await call("/api/update", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/components", mode: "one" }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { skipped: { repo: string; reason: string }[] };
+  expect(body.skipped).toHaveLength(1);
+  expect(body.skipped[0]!.repo).toBe("acme/broken");
+  expect(body.skipped[0]!.reason).toContain("unparseable");
+});
+
+// --- Fix-round: the train's poll settings are wired to the right TrainDeps fields --
+
+test("POST /api/train wires pollIntervalMs and maxPollAttempts to the correct TrainDeps fields, not swapped", async () => {
+  // Distinguishable values, and a fixture that genuinely needs more than one
+  // poll: isResolvable never resolves, so runTrain exhausts every attempt
+  // and sleeps between all but the last. If pollIntervalMs/maxPollAttempts
+  // were swapped, either the sleep duration or the attempt count below would
+  // come out wrong.
+  const sleepCalls: number[] = [];
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({
+    apisFor: factory,
+    pollIntervalMs: 7,
+    maxPollAttempts: 3,
+    isResolvable: async () => false,
+    sleep: async (ms) => {
+      sleepCalls.push(ms);
+    },
+  });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { outcome: { status: string } };
+  expect(body.outcome.status).toBe("stalled");
+
+  // maxPollAttempts=3 => isResolvable called 3 times => 2 sleeps in between,
+  // each of pollIntervalMs=7. A swap would produce 7 resolve calls and 6
+  // sleeps of 3ms instead.
+  expect(sleepCalls).toEqual([7, 7]);
+  expect(prCalls.filter((c) => c.startsWith("mergePr:")).length).toBe(1);
+});
+
+// --- Fix-round: an already-merged PR is a success, not a merge failure --------
+
+test("POST /api/train: a merge that fails because the PR is already merged counts as success, not a stall", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi({ alreadyMerged: { repo: "acme/design", pr: 10 } });
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, isResolvable: async () => true, sleep: async () => {} });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { outcome: { status: string; merged: { pkg: string; repo: string }[] } };
+  expect(body.outcome.status).toBe("success");
+  expect(body.outcome.merged).toEqual([{ pkg: "@acme/design", repo: "acme/design" }]);
+  expect(prCalls).toContain("mergePr:acme/design:10");
+  expect(prCalls).toContain("prState:acme/design:10");
+});
+
+test("POST /api/train: a merge that fails and stays open (not merged) still stalls", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi({ mergeShouldFail: true });
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, isResolvable: async () => true, sleep: async () => {} });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  const body = (await res.json()) as { outcome: { status: string; pkg: string } };
+  expect(body.outcome.status).toBe("stalled");
+  expect(body.outcome.pkg).toBe("@acme/design");
+  expect(prCalls).toContain("prState:acme/design:10");
 });
