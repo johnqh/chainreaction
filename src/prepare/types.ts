@@ -7,6 +7,8 @@ export interface RepoCapabilities {
   defaultBranch: string;
   isPrivate: boolean;
   protection: ProtectionState;
+  /** False when protection is "unprotected" or "unavailable" — there is nothing to require reviews. */
+  requiresReviews: boolean;
   autoMergeEnabled: boolean;
   hasValidationWorkflow: boolean;
 }

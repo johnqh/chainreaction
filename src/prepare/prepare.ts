@@ -30,10 +30,24 @@ export async function prepareRepo(
         `wait on, so a repo with no CI cannot take part in a cascade.`,
     );
   }
+  if (caps.protection === "protected") {
+    // setProtection is a whole-object PUT replace: sending only requiredChecks
+    // would silently strip whatever the customer already configured (required
+    // reviews, signed commits, linear history, admin enforcement, ...).
+    // Merging observed settings is also wrong — a review requirement our own
+    // identity cannot satisfy (GitHub refuses self-approval) would make
+    // auto-merge never fire. So: refuse, do not touch it.
+    blockers.push(
+      `${full} already has branch protection on ${caps.defaultBranch}` +
+        (caps.requiresReviews ? " that requires pull request reviews" : "") +
+        `. ChainReaction will not modify existing branch protection — remove it manually, ` +
+        `or adjust it to allow this App's auto-merge, then prepare again.`,
+    );
+  }
 
   if (blockers.length === 0) {
     if (!caps.autoMergeEnabled) await api.enableAutoMerge(full);
-    if (caps.protection !== "unavailable") {
+    if (caps.protection === "unprotected") {
       // Status checks only, never reviews: an identity cannot approve its own PR,
       // and the human decision is ChainReaction's own approval gate.
       await api.setProtection(full, caps.defaultBranch, requiredChecks);

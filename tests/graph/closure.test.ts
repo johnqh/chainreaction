@@ -41,6 +41,14 @@ test("the closure is transitive through devDependency edges", () => {
   expect(closure.has("@acme/top")).toBe(true);
 });
 
+test("a runtime dependent is in the closure", () => {
+  // components depends on design via `deps` (runtime), not `devDeps` — no
+  // fixture node lists @acme/design in devDeps. A validationClosure that
+  // only walked devDeps edges would miss this and under-validate every
+  // runtime dependent of a publishing package.
+  expect(validationClosure(graph, new Set(["@acme/design"])).has("@acme/components")).toBe(true);
+});
+
 test("a node with no devDeps recorded is handled", () => {
   const g = new Map<string, RepoNode>([
     ["@acme/a", { pkg: "@acme/a", repo: "acme/a", version: "1.0.0", deps: [] }],
