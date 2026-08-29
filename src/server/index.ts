@@ -14,6 +14,7 @@ import {
   MEMBERSHIP_VERIFICATION_FAILED,
 } from "../auth/oauth";
 import { SessionStore, DEFAULT_SESSION_TTL_SECONDS } from "../auth/session";
+import { handleApiRequest, type ApiDeps } from "./api";
 
 export interface AuthConfig {
   clientId: string;
@@ -31,6 +32,13 @@ export interface ServerDeps {
   /** Injected for GitHub API calls made during login. Never used for anything but those calls. */
   fetchFn?: typeof fetch;
   now?: () => number;
+  /**
+   * The hosted repos/graph/update/prs/merge/train surface (see
+   * `src/server/api.ts`). Optional so existing deployments/tests that only
+   * exercise login and the legacy token-gated UI don't need to supply GitHub
+   * App credentials. When absent, the hosted API paths simply 404.
+   */
+  api?: ApiDeps;
 }
 
 const TOKEN_HEADER = "x-chainreaction-token";
@@ -376,6 +384,14 @@ export function createServer(deps: ServerDeps, port = 3737) {
         return new Response(JSON.stringify({ ok: true }), {
           headers: { "content-type": "application/json" },
         });
+      }
+
+      // --- Hosted repos/graph/update/prs/merge/train surface --------------------
+
+      if (deps.api) {
+        const session = await sessions.readSession(cookies[SESSION_COOKIE]);
+        const apiRes = await handleApiRequest(req, url, session, deps.api);
+        if (apiRes) return apiRes;
       }
 
       return new Response("not found", { status: 404 });
