@@ -380,7 +380,7 @@ chosen:
 | B | Prepare and readiness — capability probe, Prepare, validation closure, the gate | merged |
 | C | Integration — concrete `RepoAdminApi`, package→repo mapping, required gate, CLI | written |
 | D | `ActionsValidator` — the workflow, the OIDC exchange, the runner package | written |
-| E | Cascade execution, webhooks, DAG UI, MCP server, TrueForge | not written |
+| E | Update flows and the app — repo list, dependency graph, Update / Update Chain, PR states, Auto Merge train | written |
 
 **Plan C exists because Plan B's whole-branch review found that everything Plan B built had zero
 production callers.** Plan B produced a correct library and no product; its own Global Constraints
