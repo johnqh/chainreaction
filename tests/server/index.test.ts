@@ -1,6 +1,5 @@
 import { test, expect } from "bun:test";
 import { createServer, type ServerDeps, type AuthConfig } from "../../src/server/index";
-import { Cascade } from "../../src/supervisor/state";
 
 const CLIENT_SECRET = "the-client-secret-value";
 const SESSION_SECRET = "the-session-secret-value";
@@ -47,9 +46,6 @@ function baseAuth(overrides: Partial<AuthConfig> = {}): AuthConfig {
 
 function makeDeps(overrides: Partial<ServerDeps> = {}): ServerDeps {
   return {
-    cascade: new Cascade([], 0),
-    entries: [],
-    onApprove: () => {},
     auth: baseAuth(),
     fetchFn: mockFetch(),
     now: () => 1_000_000,
@@ -68,16 +64,6 @@ async function withServer(
   } finally {
     server.stop(true);
   }
-}
-
-function cookiesFrom(res: Response): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const header of res.headers.getSetCookie()) {
-    const [pair] = header.split(";");
-    const eq = pair!.indexOf("=");
-    out.set(pair!.slice(0, eq), pair!.slice(eq + 1));
-  }
-  return out;
 }
 
 function rawCookieHeaders(res: Response): string[] {
@@ -155,6 +141,33 @@ async function callback(
   return fetch(`${baseUrl}/auth/callback?code=abc&state=${state}${extraQuery}`, {
     redirect: "manual",
     headers: cookieState !== undefined ? { cookie: `${cookieName}=${cookieState}` } : {},
+  });
+}
+
+/**
+ * POSTs to /auth/choose with `installationId` as a form field and the given
+ * pending-login cookie value. `/auth/choose` is a POST (not a GET with a
+ * query param) specifically so a SameSite=Lax pending cookie never rides
+ * along with a cross-site request — see the doc comment where the picker
+ * page is rendered in src/server/index.ts. `cookieName` defaults to the
+ * `__Host-`-prefixed name (every test server here uses an https callback
+ * URL by default); pass the bare name explicitly for a plain-http server.
+ */
+async function chooseInstallation(
+  baseUrl: string,
+  installationId: number | string,
+  pendingCookie: string | undefined,
+  cookieName = "__Host-cr_pending",
+): Promise<Response> {
+  const body = new URLSearchParams({ installationId: String(installationId) });
+  return fetch(`${baseUrl}/auth/choose`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      ...(pendingCookie !== undefined ? { cookie: `${cookieName}=${pendingCookie}` } : {}),
+    },
+    body,
   });
 }
 
@@ -366,13 +379,10 @@ test("multiple installations: callback offers a choice, and choosing a real memb
     const { state, stateCookie } = await login(baseUrl);
     const callbackRes = await callback(baseUrl, state, stateCookie);
     expect(callbackRes.status).toBe(200); // a picker page, not an immediate session
-    const pendingCookie = cookiesFrom(callbackRes).get("cr_pending")!;
+    const pendingCookie = cookieNamed(callbackRes, "cr_pending")!;
     expect(pendingCookie).toBeTruthy();
 
-    const chooseRes = await fetch(`${baseUrl}/auth/choose?installationId=2`, {
-      redirect: "manual",
-      headers: { cookie: `cr_pending=${pendingCookie}` },
-    });
+    const chooseRes = await chooseInstallation(baseUrl, 2, pendingCookie);
     expect(chooseRes.status).toBe(302);
     const sessionCookie = cookieNamed(chooseRes, "cr_session")!;
     expect(sessionCookie).toBeTruthy();
@@ -393,14 +403,34 @@ test("multiple installations: choosing an installation id the user does not belo
   await withServer(deps, async (baseUrl) => {
     const { state, stateCookie } = await login(baseUrl);
     const callbackRes = await callback(baseUrl, state, stateCookie);
-    const pendingCookie = cookiesFrom(callbackRes).get("cr_pending")!;
+    const pendingCookie = cookieNamed(callbackRes, "cr_pending")!;
 
-    const chooseRes = await fetch(`${baseUrl}/auth/choose?installationId=999`, {
-      redirect: "manual",
-      headers: { cookie: `cr_pending=${pendingCookie}` },
-    });
+    const chooseRes = await chooseInstallation(baseUrl, 999, pendingCookie);
     expect(chooseRes.status).toBe(403);
     expect(cookiePresent(chooseRes, "cr_session")).toBe(false);
+  });
+});
+
+// /auth/choose is a POST, not a GET-with-query-param, precisely so a
+// SameSite=Lax pending cookie never rides along with a cross-site
+// *navigation* (a plain link click) the way a GET would let it. Confirming
+// GET is simply unhandled (falls through to the generic 404, exactly like
+// hitting any other path with the wrong method) is the regression this
+// guards: a route that matched both methods would silently reopen the gap.
+test("GET /auth/choose (the old GET-based flow) is no longer handled", async () => {
+  const deps = makeDeps({
+    fetchFn: mockFetch({ installations: [{ id: 1, account: "acme" }, { id: 2, account: "widgets-inc" }] }),
+  });
+  await withServer(deps, async (baseUrl) => {
+    const { state, stateCookie } = await login(baseUrl);
+    const callbackRes = await callback(baseUrl, state, stateCookie);
+    const pendingCookie = cookieNamed(callbackRes, "cr_pending")!;
+
+    const res = await fetch(`${baseUrl}/auth/choose?installationId=2`, {
+      redirect: "manual",
+      headers: { cookie: `__Host-cr_pending=${pendingCookie}` },
+    });
+    expect(res.status).toBe(404);
   });
 });
 
@@ -463,13 +493,10 @@ test("/auth/choose: a verification failure (not a clean membership answer) is a 
   await withServer(makeDeps({ fetchFn: flakyFetchFn }), async (baseUrl) => {
     const { state, stateCookie } = await login(baseUrl);
     const callbackRes = await callback(baseUrl, state, stateCookie);
-    const pendingCookie = cookiesFrom(callbackRes).get("cr_pending")!;
+    const pendingCookie = cookieNamed(callbackRes, "cr_pending")!;
 
     failOnInstallations = true;
-    const chooseRes = await fetch(`${baseUrl}/auth/choose?installationId=2`, {
-      redirect: "manual",
-      headers: { cookie: `cr_pending=${pendingCookie}` },
-    });
+    const chooseRes = await chooseInstallation(baseUrl, 2, pendingCookie);
     const body = await chooseRes.text();
     expect(chooseRes.status).toBe(502);
     expect(body).not.toContain("super-secret-user-token");
@@ -634,22 +661,28 @@ test("a hosted API route is scoped to the signed-in session's installation, end 
   expect(calls).toEqual([1]);
 });
 
-test("existing /api/token and /api/approve behavior is unaffected", async () => {
-  let approved = false;
-  await withServer(makeDeps({ onApprove: () => { approved = true; } }), async (baseUrl) => {
-    const tokenRes = await fetch(`${baseUrl}/api/token`);
-    const { token } = (await tokenRes.json()) as { token: string };
-    expect(token).toBeTruthy();
+// The SSE-driven supervisor screen these three routes served is gone from
+// src/ (no EventSource, no client that ever called them) and src/cli/deps.ts
+// only ever wired them to an inert `new Cascade([], 0)` and a no-op
+// `onApprove`. `/api/token` handed out a bearer token with no
+// authentication at all; that was harmless only because of the inert
+// wiring behind it, and removal (not repurposing) was the security review's
+// call — `/api/token`'s shared-secret model doesn't fit the session model
+// that replaced it. All three routes must now read as plain 404s, same as
+// any other unmounted path.
+test("the removed supervisor routes (/api/token, /api/state, /api/approve) are gone: they 404 like any other unmounted path", async () => {
+  await withServer(makeDeps(), async (baseUrl) => {
+    const token = await fetch(`${baseUrl}/api/token`);
+    expect(token.status).toBe(404);
 
-    const unauthorized = await fetch(`${baseUrl}/api/approve`, { method: "POST" });
-    expect(unauthorized.status).toBe(401);
+    const state = await fetch(`${baseUrl}/api/state?token=anything`);
+    expect(state.status).toBe(404);
 
-    const ok = await fetch(`${baseUrl}/api/approve`, {
+    const approve = await fetch(`${baseUrl}/api/approve`, {
       method: "POST",
-      headers: { "x-chainreaction-token": token },
+      headers: { "x-chainreaction-token": "anything" },
     });
-    expect(ok.status).toBe(200);
-    expect(approved).toBe(true);
+    expect(approve.status).toBe(404);
   });
 });
 
@@ -692,6 +725,100 @@ test("the session cookie's actual Set-Cookie name is __Host--prefixed when the c
     expect(names).toContain("cr_session");
     expect(names).not.toContain("__Host-cr_session");
   });
+});
+
+// cr_pending was skipped by an earlier round's __Host- pass because it
+// wasn't named in that task's scope — but it carries the pending-login id
+// /auth/choose reads, is SameSite=Lax like the other two, and is exactly as
+// exposed to cookie tossing from a sibling subdomain. It gets the identical
+// treatment: __Host--prefixed over https, bare over plain http.
+test("the pending-login cookie's actual Set-Cookie name is __Host--prefixed when the callback URL is https, and bare over plain http", async () => {
+  await withServer(
+    makeDeps({
+      auth: baseAuth({ callbackUrl: "https://app.example.test/auth/callback" }),
+      fetchFn: mockFetch({ installations: [{ id: 1, account: "acme" }, { id: 2, account: "widgets" }] }),
+    }),
+    async (baseUrl) => {
+      const { state, stateCookie } = await login(baseUrl);
+      const res = await callback(baseUrl, state, stateCookie);
+      const names = res.headers.getSetCookie().map((h) => h.slice(0, h.indexOf("=")));
+      expect(names).toContain("__Host-cr_pending");
+      expect(names).not.toContain("cr_pending");
+    },
+  );
+
+  await withServer(
+    makeDeps({
+      auth: baseAuth({ callbackUrl: "http://app.example.test/auth/callback" }),
+      fetchFn: mockFetch({ installations: [{ id: 1, account: "acme" }, { id: 2, account: "widgets" }] }),
+    }),
+    async (baseUrl) => {
+      const loginRes = await fetch(`${baseUrl}/auth/login`, { redirect: "manual" });
+      const location = loginRes.headers.get("location")!;
+      const state = new URL(location).searchParams.get("state")!;
+      const stateCookie = cookieNamed(loginRes, "cr_oauth_state")!;
+      const res = await callback(baseUrl, state, stateCookie, "", "cr_oauth_state");
+      const names = res.headers.getSetCookie().map((h) => h.slice(0, h.indexOf("=")));
+      expect(names).toContain("cr_pending");
+      expect(names).not.toContain("__Host-cr_pending");
+    },
+  );
+});
+
+test("the pending-login cookie carries HttpOnly and SameSite=Lax, and Secure only when the callback URL is https", async () => {
+  const installations = [{ id: 1, account: "acme" }, { id: 2, account: "widgets" }];
+
+  await withServer(
+    makeDeps({ auth: baseAuth({ callbackUrl: "https://app.example.test/auth/callback" }), fetchFn: mockFetch({ installations }) }),
+    async (baseUrl) => {
+      const { state, stateCookie } = await login(baseUrl);
+      const res = await callback(baseUrl, state, stateCookie);
+      const raw = rawCookieHeaderNamed(res, "cr_pending")!;
+      expect(raw).toMatch(/HttpOnly/i);
+      expect(raw).toMatch(/SameSite=Lax/i);
+      expect(raw).toMatch(/Secure/i);
+    },
+  );
+
+  await withServer(
+    makeDeps({ auth: baseAuth({ callbackUrl: "http://app.example.test/auth/callback" }), fetchFn: mockFetch({ installations }) }),
+    async (baseUrl) => {
+      const loginRes = await fetch(`${baseUrl}/auth/login`, { redirect: "manual" });
+      const location = loginRes.headers.get("location")!;
+      const state = new URL(location).searchParams.get("state")!;
+      const stateCookie = cookieNamed(loginRes, "cr_oauth_state")!;
+      const res = await callback(baseUrl, state, stateCookie, "", "cr_oauth_state");
+      const raw = rawCookieHeaderNamed(res, "cr_pending")!;
+      expect(raw).toMatch(/HttpOnly/i);
+      expect(raw).toMatch(/SameSite=Lax/i);
+      expect(raw).not.toMatch(/Secure/i);
+    },
+  );
+});
+
+// Same attack as the state/session cookie-tossing tests below, reproduced
+// against cr_pending: a raw Cookie header carrying two values for its name
+// must be rejected outright (read as absent), never last-wins-accepted.
+test("a Cookie header carrying two values for the pending-login cookie name is treated as no pending login at all, not one of the two", async () => {
+  await withServer(
+    makeDeps({ fetchFn: mockFetch({ installations: [{ id: 1, account: "acme" }, { id: 2, account: "widgets" }] }) }),
+    async (baseUrl) => {
+      const { state, stateCookie } = await login(baseUrl);
+      const callbackRes = await callback(baseUrl, state, stateCookie);
+      const realPendingCookie = cookieNamed(callbackRes, "cr_pending")!;
+
+      const res = await fetch(`${baseUrl}/auth/choose`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `__Host-cr_pending=attacker-garbage; __Host-cr_pending=${realPendingCookie}`,
+        },
+        body: new URLSearchParams({ installationId: "2" }),
+      });
+      expect(res.status).toBe(400);
+    },
+  );
 });
 
 // This is the actual cookie-tossing attack, reproduced directly: a sibling

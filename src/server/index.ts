@@ -1,6 +1,4 @@
 import index from "../web/index.html";
-import { Cascade } from "../supervisor/state";
-import type { ChangesetEntry } from "../graph/types";
 import {
   authorizeUrl,
   exchangeCode,
@@ -25,9 +23,6 @@ export interface AuthConfig {
 }
 
 export interface ServerDeps {
-  cascade: Cascade;
-  entries: ChangesetEntry[];
-  onApprove: () => void;
   auth: AuthConfig;
   /** Injected for GitHub API calls made during login. Never used for anything but those calls. */
   fetchFn?: typeof fetch;
@@ -41,9 +36,8 @@ export interface ServerDeps {
   api?: ApiDeps;
 }
 
-const TOKEN_HEADER = "x-chainreaction-token";
 const SESSION_COOKIE_BASE = "cr_session";
-const PENDING_COOKIE = "cr_pending";
+const PENDING_COOKIE_BASE = "cr_pending";
 const PENDING_COOKIE_MAX_AGE_SECONDS = 300;
 const STATE_COOKIE_BASE = "cr_oauth_state";
 
@@ -74,10 +68,6 @@ function hostCookieName(base: string, secure: boolean): string {
 /** Maps an `assertInstallationMembership` failure to a status: a verification failure is retryable, a clean "no" is final. */
 function membershipFailureStatus(err: unknown): number {
   return err instanceof Error && err.message === MEMBERSHIP_VERIFICATION_FAILED ? 502 : 403;
-}
-
-function randomToken(): string {
-  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
 }
 
 /**
@@ -138,19 +128,13 @@ function escapeHtml(s: string): string {
 }
 
 export function createServer(deps: ServerDeps, port = 3737) {
-  const token = process.env.CR_UI_TOKEN ?? randomToken();
-  if (!process.env.CR_UI_TOKEN) {
-    console.warn(
-      `CR_UI_TOKEN not set; generated a random token for this run (set CR_UI_TOKEN to pin it): ${token}`,
-    );
-  }
-
   const fetchFn = deps.fetchFn ?? fetch;
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
   const secureCookies = new URL(deps.auth.callbackUrl).protocol === "https:";
   const callbackPath = new URL(deps.auth.callbackUrl).pathname;
   const SESSION_COOKIE = hostCookieName(SESSION_COOKIE_BASE, secureCookies);
   const STATE_COOKIE = hostCookieName(STATE_COOKIE_BASE, secureCookies);
+  const PENDING_COOKIE = hostCookieName(PENDING_COOKIE_BASE, secureCookies);
 
   const sessions = new SessionStore(deps.auth.sessionSecret, now);
   const states = new OAuthStateStore(now);
@@ -304,8 +288,22 @@ export function createServer(deps: ServerDeps, port = 3737) {
         // a client-readable cookie value) and let the user pick. `/auth/choose`
         // re-verifies whatever they pick against a fresh membership check.
         const pendingId = pendingLogins.create({ userId: String(user.id), userToken: accessToken });
+        // Rendered as a per-installation POST form, not a GET link: a GET
+        // would be exactly the SameSite=Lax gap the __Host- prefix above
+        // does not close on its own — Lax cookies still ride along on a
+        // cross-site top-level *navigation* (a plain link click), so an
+        // attacker could hand a mid-login victim a link naming an
+        // installationId of the attacker's choosing (assertInstallationMembership
+        // below still stops them from naming one the victim doesn't belong
+        // to, but not from steering the victim onto the wrong one they do
+        // belong to). A cross-site POST does not carry a SameSite=Lax
+        // cookie at all, so an attacker-hosted auto-submitting form gets no
+        // pending cookie to ride along with.
         const options = installations
-          .map((i) => `<li><a href="/auth/choose?installationId=${i.id}">${escapeHtml(i.account)}</a></li>`)
+          .map(
+            (i) =>
+              `<li><form method="post" action="/auth/choose"><input type="hidden" name="installationId" value="${i.id}"><button type="submit">${escapeHtml(i.account)}</button></form></li>`,
+          )
           .join("");
         const pickerHeaders = new Headers({ "content-type": "text/html" });
         pickerHeaders.append(
@@ -319,14 +317,23 @@ export function createServer(deps: ServerDeps, port = 3737) {
         );
       }
 
-      if (url.pathname === "/auth/choose" && req.method === "GET") {
+      if (url.pathname === "/auth/choose" && req.method === "POST") {
         const pendingId = cookies[PENDING_COOKIE];
         const login = pendingId ? pendingLogins.consume(pendingId) : null;
         if (!login) {
           return new Response("login session expired or already used — sign in again", { status: 400 });
         }
-        const installationIdParam = url.searchParams.get("installationId");
-        const requested = installationIdParam === null ? NaN : Number(installationIdParam);
+        // Form-encoded body, not a query param: see the doc comment where
+        // this picker page is rendered above for why this is a POST at all.
+        let installationIdParam: FormDataEntryValue | null;
+        try {
+          const form = await req.formData();
+          installationIdParam = form.get("installationId");
+        } catch {
+          return new Response("invalid form body", { status: 400 });
+        }
+        const requested =
+          installationIdParam === null || typeof installationIdParam !== "string" ? NaN : Number(installationIdParam);
         if (!Number.isInteger(requested)) {
           return new Response("invalid installationId", { status: 400 });
         }
@@ -385,64 +392,6 @@ export function createServer(deps: ServerDeps, port = 3737) {
           JSON.stringify({ userId: session.userId, installationId: session.installationId }),
           { headers: { "content-type": "application/json" } },
         );
-      }
-
-      // --- Existing token-gated supervisor UI -----------------------------------
-
-      // Bootstrap endpoint: hands the token to the page that was just served from
-      // this same origin. A cross-origin page can trigger the request but, absent
-      // CORS headers here, cannot read the response body — so it cannot recover
-      // the token this way.
-      if (url.pathname === "/api/token") {
-        return new Response(JSON.stringify({ token }), {
-          headers: { "content-type": "application/json" },
-        });
-      }
-
-      if (url.pathname === "/api/state") {
-        if (url.searchParams.get("token") !== token) {
-          return new Response("unauthorized", { status: 401 });
-        }
-
-        let timer: ReturnType<typeof setInterval> | undefined;
-        const stream = new ReadableStream({
-          start(controller) {
-            const send = () => {
-              try {
-                controller.enqueue(
-                  `data: ${JSON.stringify(deps.cascade.snapshot())}\n\n`,
-                );
-              } catch {
-                // Stream is no longer writable (client gone). Stop ticking rather
-                // than letting the next enqueue throw again inside setInterval.
-                if (timer) clearInterval(timer);
-              }
-            };
-            send();
-            timer = setInterval(send, 2000);
-            req.signal.addEventListener("abort", () => {
-              if (timer) clearInterval(timer);
-            });
-          },
-          cancel() {
-            // Independent cleanup path: fires if the consumer cancels the stream
-            // even when 'abort' on the request signal doesn't (or hasn't yet).
-            if (timer) clearInterval(timer);
-          },
-        });
-        return new Response(stream, {
-          headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-        });
-      }
-
-      if (url.pathname === "/api/approve" && req.method === "POST") {
-        if (req.headers.get(TOKEN_HEADER) !== token) {
-          return new Response("unauthorized", { status: 401 });
-        }
-        deps.onApprove();
-        return new Response(JSON.stringify({ ok: true }), {
-          headers: { "content-type": "application/json" },
-        });
       }
 
       // --- Hosted repos/graph/update/prs/merge/train surface --------------------
