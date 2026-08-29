@@ -6,6 +6,8 @@ const ok = (repo: string): PrepareResult =>
   ({ repo, ready: true, mechanism: "auto-merge", blockers: [] });
 const bad = (repo: string, why: string): PrepareResult =>
   ({ repo, ready: false, mechanism: "auto-merge", blockers: [why] });
+const controlPlane = (repo: string): PrepareResult =>
+  ({ repo, ready: true, mechanism: "control-plane", blockers: [] });
 
 test("passes when every required repo is ready", () => {
   const m = new Map([["acme/a", ok("acme/a")], ["acme/b", ok("acme/b")]]);
@@ -36,4 +38,14 @@ test("reports every unready repo, not just the first", () => {
 test("ignores prepared repos that are not required", () => {
   const m = new Map([["acme/a", ok("acme/a")], ["acme/z", bad("acme/z", "irrelevant")]]);
   expect(() => assertPrepared(m, ["acme/a"])).not.toThrow();
+});
+
+test("a repo that is ready:true via control-plane merge is still refused — that mechanism is not implemented", () => {
+  const m = new Map([["acme/a", ok("acme/a")], ["acme/b", controlPlane("acme/b")]]);
+  expect(() => assertPrepared(m, ["acme/a", "acme/b"])).toThrow(/acme\/b.*control-plane merge/s);
+});
+
+test("refuses to certify an empty repository set", () => {
+  const m = new Map([["acme/a", ok("acme/a")]]);
+  expect(() => assertPrepared(m, [])).toThrow(/empty repository set/);
 });

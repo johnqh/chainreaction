@@ -1,18 +1,19 @@
 import { test, expect } from "bun:test";
 import { mergeMechanismFor, prepareRepo } from "../../src/prepare/prepare";
-import type { RepoAdminApi, RepoMeta } from "../../src/prepare/adminApi";
+import type { ProtectionProbe, RepoAdminApi, RepoMeta } from "../../src/prepare/adminApi";
 import type { RepoCapabilities } from "../../src/prepare/types";
 
 const caps = (over: Partial<RepoCapabilities> = {}): RepoCapabilities => ({
   repo: "acme/lib", defaultBranch: "main", isPrivate: false,
-  protection: "unprotected", autoMergeEnabled: false, hasValidationWorkflow: true, ...over,
+  protection: "unprotected", requiresReviews: false, autoMergeEnabled: false,
+  hasValidationWorkflow: true, ...over,
 });
 
-function api(over: Partial<{ meta: RepoMeta; protection: number; file: boolean }> = {}) {
+function api(over: Partial<{ meta: RepoMeta; protection: ProtectionProbe; file: boolean }> = {}) {
   const calls: string[] = [];
   const a: RepoAdminApi = {
     getRepo: async () => over.meta ?? { defaultBranch: "main", isPrivate: false, allowAutoMerge: false },
-    getProtection: async () => over.protection ?? 404,
+    getProtection: async () => over.protection ?? { status: 404 },
     hasFile: async () => over.file ?? true,
     setProtection: async (_f, _b, contexts) => { calls.push(`setProtection:${contexts.join("+")}`); },
     enableAutoMerge: async () => { calls.push("enableAutoMerge"); },
@@ -30,18 +31,46 @@ test("a repo that cannot be protected falls back to control-plane merge", () => 
 });
 
 test("prepare applies protection and enables auto-merge on a protectable repo", async () => {
-  const { a, calls } = api({ protection: 404 });
+  const { a, calls } = api({ protection: { status: 404 } });
   const res = await prepareRepo(a, "acme/lib", ["ci"]);
   expect(calls).toEqual(["enableAutoMerge", "setProtection:ci"]);
   expect(res).toMatchObject({ repo: "acme/lib", ready: true, mechanism: "auto-merge", blockers: [] });
 });
 
 test("prepare does not attempt protection when it is unavailable, and still succeeds", async () => {
-  const { a, calls } = api({ protection: 403, meta: { defaultBranch: "main", isPrivate: true, allowAutoMerge: false } });
+  const { a, calls } = api({
+    protection: { status: 403, message: "Upgrade to GitHub Pro or make this repository public to enable this feature." },
+    meta: { defaultBranch: "main", isPrivate: true, allowAutoMerge: false },
+  });
   const res = await prepareRepo(a, "acme/lib", ["ci"]);
   expect(calls.some((c) => c.startsWith("setProtection"))).toBe(false);
   expect(res.ready).toBe(true);
   expect(res.mechanism).toBe("control-plane");
+});
+
+test("an already-protected repo is blocked and setProtection is never called", async () => {
+  const { a, calls } = api({
+    protection: { status: 200, body: { required_pull_request_reviews: { required_approving_review_count: 2 } } },
+  });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(false);
+  expect(res.blockers.join(" ")).toMatch(/already has branch protection/);
+  expect(res.blockers.join(" ")).toMatch(/will not modify existing branch protection/);
+  expect(calls.some((c) => c.startsWith("setProtection"))).toBe(false);
+});
+
+test("an already-protected repo without a review requirement is still blocked", async () => {
+  const { a, calls } = api({ protection: { status: 200, body: { required_status_checks: {} } } });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(false);
+  expect(calls.some((c) => c.startsWith("setProtection"))).toBe(false);
+});
+
+test("an unprotected repo still gets protection applied", async () => {
+  const { a, calls } = api({ protection: { status: 404 } });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(true);
+  expect(calls).toContain("setProtection:ci");
 });
 
 test("a missing validation workflow blocks readiness and names the file", async () => {
