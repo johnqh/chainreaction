@@ -284,6 +284,43 @@ and no test fixture relies on `@sudobility` or `johnqh` to pass.
 
 ---
 
+## Task 5a: sign in with GitHub
+
+**Files:** `src/auth/oauth.ts`, `src/auth/session.ts`; modify `src/server/index.ts`.
+Tests `tests/auth/oauth.test.ts`, `tests/auth/session.test.ts`.
+
+**Why:** step 1 of the requirements is "user logs in with his github credential,
+then he can see a list of all his projects." Nothing in the codebase does this.
+`src/auth/` holds only App authentication; the UI's only credential is
+`CR_UI_TOKEN`, a shared local secret. And the installation is pinned by
+`CR_INSTALLATION_ID`, so `listRepos` returns one preconfigured account's repos.
+
+Without this, `GET /api/repos` has no signed-in user to scope to and serves the
+operator's own repositories to whoever loads the page. It returns 200 with
+well-formed JSON, so nothing looks wrong — and on a hosted deployment that is a
+cross-tenant data leak.
+
+**Produces:**
+- `authorizeUrl(clientId, redirectUri, state): string`
+- `exchangeCode(code, creds, fetchFn): Promise<{ accessToken: string }>`
+- `listUserInstallations(userToken, fetchFn): Promise<InstallationRef[]>` — `GET /user/installations`
+- `createSession(userId, installationId)` / `readSession(cookie)`, signed and expiring
+
+**Security requirements, each independently tested:**
+- `state` is generated per-request, compared on callback, and single-use. A
+  callback whose `state` does not match is rejected. Without this the login is
+  open to CSRF.
+- The session cookie is signed; a tampered cookie is rejected, not merely ignored.
+- `HttpOnly`, `SameSite=Lax`, and `Secure` when the callback URL is https.
+- **No user token, client secret, session secret, or App key appears in any log,
+  error, response body, or rendered page.** Force each failure path and assert
+  the secret is absent from the message.
+- Every request scopes to the installation on the session. A user must never be
+  able to name an installation they do not belong to — verify membership against
+  `listUserInstallations`, never trust a client-supplied id.
+
+---
+
 ## Cut List
 
 1. Task 6's graph layout sophistication — a level-ordered list with coloured edge labels conveys the same information.
