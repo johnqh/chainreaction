@@ -19,7 +19,7 @@ test("scanRepos skips an unparseable manifest but warns to stderr, naming the fi
   mkdirSync(join(root, "good_repo"), { recursive: true });
   writeFileSync(
     join(root, "good_repo", "package.json"),
-    JSON.stringify({ name: "@sudobility/good", version: "1.0.0" }),
+    JSON.stringify({ name: "@acme/good", version: "1.0.0" }),
   );
 
   const originalError = console.error;
@@ -30,14 +30,14 @@ test("scanRepos skips an unparseable manifest but warns to stderr, naming the fi
 
   let graph;
   try {
-    graph = scanRepos(root);
+    graph = scanRepos(root, "@acme/", "acme");
   } finally {
     console.error = originalError;
   }
 
   // The corrupted repo never entered the graph...
   expect(graph.size).toBe(1);
-  expect(graph.has("@sudobility/good")).toBe(true);
+  expect(graph.has("@acme/good")).toBe(true);
 
   // ...but a warning naming the offending manifest was emitted.
   expect(calls.length).toBeGreaterThanOrEqual(1);

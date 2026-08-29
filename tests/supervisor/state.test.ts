@@ -3,8 +3,8 @@ import { Cascade, detectStall } from "../../src/supervisor/state";
 import type { ChangesetEntry } from "../../src/graph/types";
 
 const entries: ChangesetEntry[] = [
-  { pkg: "a", dir: "/a", repo: "johnqh/a", fromVersion: "1.0.0", toVersion: "1.0.1", depBumps: {}, level: 0 },
-  { pkg: "b", dir: "/b", repo: "johnqh/b", fromVersion: "1.0.0", toVersion: "1.0.1", depBumps: { a: "^1.0.1" }, level: 1 },
+  { pkg: "a", dir: "/a", repo: "acme/a", fromVersion: "1.0.0", toVersion: "1.0.1", depBumps: {}, level: 0 },
+  { pkg: "b", dir: "/b", repo: "acme/b", fromVersion: "1.0.0", toVersion: "1.0.1", depBumps: { a: "^1.0.1" }, level: 1 },
 ];
 
 test("every node starts pending", () => {
@@ -32,8 +32,8 @@ test("snapshot exposes nodes and edges for the UI", () => {
   c.set("a", "published");
   const s = c.snapshot();
   expect(s.nodes).toEqual([
-    { pkg: "a", repo: "johnqh/a", level: 0, version: "1.0.1", state: "published" },
-    { pkg: "b", repo: "johnqh/b", level: 1, version: "1.0.1", state: "pending" },
+    { pkg: "a", repo: "acme/a", level: 0, version: "1.0.1", state: "published" },
+    { pkg: "b", repo: "acme/b", level: 1, version: "1.0.1", state: "pending" },
   ]);
   expect(s.edges).toEqual([{ from: "a", to: "b" }]);
 });

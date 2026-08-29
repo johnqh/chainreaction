@@ -11,7 +11,7 @@ const COLOR: Record<NodeState, string> = {
   "ci-running": "#b7791f", merged: "#2c7a7b", published: "#2f855a", stalled: "#c53030",
 };
 
-export function App() {
+export function App({ scope }: { scope: string }) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [approved, setApproved] = useState(false);
   const [token, setToken] = useState<string | null>(null);
@@ -71,7 +71,7 @@ export function App() {
             <div key={n.pkg} title={`${n.repo} → ${n.version}`}
                  style={{ background: COLOR[n.state], padding: "8px 14px", borderRadius: 6,
                           fontSize: 13, transition: "background 400ms" }}>
-              {n.pkg.replace("@sudobility/", "")}
+              {n.pkg.replace(scope, "")}
               <span style={{ opacity: 0.65, marginLeft: 8 }}>{n.state}</span>
             </div>
           ))}
