@@ -372,7 +372,7 @@ chosen:
 | A | Identity and graph — App auth, API-backed `GraphSource`, `planCascade` | merged |
 | B | Prepare and readiness — capability probe, Prepare, validation closure, the gate | merged |
 | C | Integration — concrete `RepoAdminApi`, package→repo mapping, required gate, CLI | written |
-| D | `ActionsValidator` — the workflow, the OIDC exchange, the runner package | not written |
+| D | `ActionsValidator` — the workflow, the OIDC exchange, the runner package | written |
 | E | Cascade execution, webhooks, DAG UI, MCP server, TrueForge | not written |
 
 **Plan C exists because Plan B's whole-branch review found that everything Plan B built had zero
