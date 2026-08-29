@@ -18,7 +18,34 @@ The spec's Phase 1 named Plan B as "Prepare and Validation". That is too large f
 - **Plan C** — `ActionsValidator`: the workflow, the OIDC exchange, the runner.
 - **Plan D** — cascade execution, webhooks, UI, MCP server, TrueForge.
 
-Plan B produces working software on its own: *tell me which of my repos can take part, make them able to, and refuse to plan around ones that cannot.*
+Plan B produces a correct, well-tested **library** for deciding which repos can take part, making
+them able to, and refusing to plan around ones that cannot.
+
+> **Correction, from the final whole-branch review.** An earlier draft of this line claimed Plan B
+> "produces working software on its own". That is not true, and the contradiction originates in this
+> plan's own Global Constraints, which forbid touching `planCascade`. Confirmed by grep:
+> `validationClosure`, `assertPrepared`, `prepareRepo`, `probeRepo` and `mergeMechanismFor` have
+> **zero production callers** — every reference outside their own module is a test. There is also no
+> concrete `RepoAdminApi` anywhere in the repository; the File Structure table promised
+> `InstallationRepoAdminApi` and no task step creates it. That is Plan C work, built the way
+> `InstallationGitHubApi` is: over a `TokenProvider`, with response-shape validation matching
+> `installationApi.ts`.
+>
+> **Four things must be true before Plan B's safety properties are load-bearing:**
+>
+> 1. `InstallationRepoAdminApi` exists, with response-shape validation. Note it must populate the
+>    `message` and `body` fields of `ProtectionProbe` from the real response — the 403 classification
+>    depends on them.
+> 2. `planCascade` calls `assertPrepared` **before** `computeChangeset` — after the gate passes, not
+>    alongside it.
+> 3. The package-name → repo-name mapping between `validationClosure`'s output and `assertPrepared`'s
+>    input is written **once**, in one place, and tested. `validationClosure` returns package names
+>    (`@acme/design`); `assertPrepared` keys on repo full names (`acme/design`); both are bare
+>    strings, so a mapping that silently drops unknowns turns the gate into a no-op reporting success.
+> 4. The validation dispatch payload carries the **validation closure**, not `affected` — otherwise
+>    Task 3 is dead code and the `xray_web` / `building_blocks` cases it exists for go unvalidated.
+>
+> Until all four hold: a gate nobody calls is not a gate.
 
 Plan A is a hard prerequisite — everything here runs on installation tokens and `RepoNode`s.
 
@@ -53,7 +80,7 @@ All four were measured against the real installation (157364042); do not re-deri
 | `src/prepare/types.ts` | `MergeMechanism`, `RepoCapabilities`, `PrepareResult` |
 | `src/prepare/probe.ts` | Read-only capability probe |
 | `src/prepare/prepare.ts` | Apply protection and auto-merge; select the mechanism; report blockers |
-| `src/prepare/adminApi.ts` | `RepoAdminApi` interface + `InstallationRepoAdminApi` |
+| `src/prepare/adminApi.ts` | `RepoAdminApi` interface **only** — see the correction below |
 | `src/graph/closure.ts` | The validation closure — devDependency-aware |
 | `src/graph/types.ts` | *(modified)* `RepoNode` gains optional `devDeps` |
 | `src/graph/githubSource.ts` | *(modified)* populate `devDeps` |
