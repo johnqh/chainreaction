@@ -10,17 +10,47 @@
 // `session: SessionPayload | null` (never reads a cookie or a client-supplied
 // installation id itself) and is scoped to `session.installationId` alone. A
 // missing/invalid session is always a flat 401 — never a fall-through to a
-// default installation. A repo or PR named in a request body is only ever
-// acted on after confirming it belongs to `session.installationId`'s own
-// repository list, freshly re-checked on every mutating call — a client
-// cannot merge or open a PR against a repo it doesn't own by simply naming it.
+// default installation. The guarantee is symmetric across reads and writes:
+// a repo or PR named in a request body, on the mutating routes (/api/prs,
+// /api/merge, /api/train, /api/published), is only ever acted on after
+// confirming it belongs to the *signed-in user's* own accessible repos
+// within that installation; a repo, package, version, or dependency edge is
+// likewise never *returned* by a read route (/api/repos, /api/graph,
+// /api/update) unless it belongs to that same accessible set — via
+// `ownedRepos`, which calls `GET /user/installations/{id}/repositories`
+// with the user's own OAuth token (decrypted from the session) — freshly
+// re-checked on every call, read or write. This is deliberately never the
+// App installation's own repo list (`GET /installation/repositories`,
+// fetched with the App's token): GitHub grants the App access to a repo the
+// instant *any* member of the installation's account can see it, so gating
+// on the App's reach would let a read-only org member, or an outside
+// collaborator on one unrelated repo, both act on and *read back the
+// existence of* every repo/package the App can reach — a confused deputy on
+// both axes, not just the write one. `GitHubGraphSource` still loads the
+// full, App-scoped graph (`/api/graph` and `/api/update` need the whole
+// installation's dependency edges to compute a correct chain — a
+// downstream consumer the user cannot see still needs to be walked to keep
+// the chain internally consistent), but every response is filtered to the
+// user's own accessible repos before it leaves this file — see
+// `filterGraphToOwnedRepos`/`filterSkippedToOwnedRepos` below. `/api/prs`
+// and `/api/train` additionally re-verify the user still belongs to the
+// installation at all (`assertInstallationMembership`) before touching
+// anything, so a removed collaborator or a revoked installation loses write
+// access on their very next mutating call, not just at the end of the
+// session TTL.
 import type { SessionPayload } from "../auth/session";
 import { TokenStore, type AppCredentials } from "../auth/appAuth";
+import {
+  assertInstallationMembership,
+  listUserInstallationRepositories,
+  UserTokenRejectedError,
+  MEMBERSHIP_VERIFICATION_FAILED,
+} from "../auth/oauth";
 import { InstallationGitHubApi } from "../github/installationApi";
 import { InstallationPrApi, type PrApi } from "../github/prApi";
 import { InstallationRepoAdminApi } from "../prepare/installationAdminApi";
 import type { RepoAdminApi } from "../prepare/adminApi";
-import type { GitHubApi, RepoRef } from "../graph/githubSource";
+import type { GitHubApi, RepoRef, SkippedRepo } from "../graph/githubSource";
 import { GitHubGraphSource } from "../graph/githubSource";
 import { assessRepo } from "../prepare/prepare";
 import type { PrepareResult } from "../prepare/types";
@@ -28,6 +58,7 @@ import { planUpdateOne, planUpdateChain } from "../plan/planUpdate";
 import { openUpdatePrs, classifyPr, type PrState } from "../pr/lifecycle";
 import { runTrain, type TrainDeps, type TrainOutcome } from "../pr/train";
 import type { ChangesetEntry, RepoNode } from "../graph/types";
+import { bumpPatch } from "../graph/changeset";
 import { classifyEdges } from "../web/graphModel";
 import { applyEntry } from "../sandbox/workspace";
 
@@ -167,20 +198,126 @@ function parseUpdateBody(raw: unknown): UpdateRequestBody | null {
   return { pkg, mode };
 }
 
+// Allowlist grammar, not a denylist: a client-authored `toVersion`/`depBumps`
+// value is committed verbatim into a customer's package.json (see
+// `openPrForEntry` -> `applyEntry`), and CI then runs `bun install` against
+// it holding an npm publish token. A denylist of bad prefixes ("git", "http:",
+// ...) would be a permanent game of whack-a-mole against every scheme/protocol
+// bun's resolver understands, today and in the future; an allowlist that only
+// ever matches a bare plain-semver version (`toVersion`) or a caret/tilde/bare
+// semver range (`depBumps` values) cannot be bypassed by a scheme we forgot to
+// list, because nothing outside the allowed shape can match at all.
+//
+// `SEMVER_RANGE` must accept a full semver core plus an optional prerelease
+// and/or build-metadata suffix, not just `\d+\.\d+\.\d+`: `planUpdateOne`
+// (src/plan/planUpdate.ts) builds a dependency's `depBumps` value as
+// `^${depNode.version}` straight from that dependency's *current* graph
+// version — untouched by `bumpPatch` — so a dependency currently published
+// at a prerelease tag (e.g. "1.2.3-beta.1") produces "^1.2.3-beta.1" here.
+// The narrower digits-only grammar rejected that legitimate, planner-emitted
+// range outright: `/api/update` would return 200 with it, and the very next
+// `/api/prs` call feeding that same entry back would 400 as if the client
+// had sent malformed JSON. Widening the grammar to the prerelease/build
+// characters semver itself allows (`[0-9A-Za-z-]`, dot-separated, a literal
+// `-` before prerelease and `+` before build metadata) keeps this an
+// allowlist, not a denylist: none of those characters can ever spell a
+// scheme, a host, or a path separator, so `git+ssh://...`, `file:...`, and
+// every other rejected shape from Critical-B's original fix still cannot
+// match — the grammar only grew inside the "this is definitely a version
+// range" shape, never outside it.
+const PLAIN_SEMVER = /^\d+\.\d+\.\d+$/;
+const SEMVER_PRERELEASE_AND_BUILD = "(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?";
+const SEMVER_RANGE = new RegExp(`^[\\^~]?\\d+\\.\\d+\\.\\d+${SEMVER_PRERELEASE_AND_BUILD}$`);
+
 function isChangesetEntry(v: unknown): v is ChangesetEntry {
   if (!isRecord(v)) return false;
   if (typeof v["pkg"] !== "string" || v["pkg"].length === 0) return false;
   if (typeof v["repo"] !== "string" || v["repo"].length === 0) return false;
   if (typeof v["fromVersion"] !== "string") return false;
-  if (typeof v["toVersion"] !== "string") return false;
+  if (typeof v["toVersion"] !== "string" || !PLAIN_SEMVER.test(v["toVersion"])) return false;
   if (typeof v["level"] !== "number") return false;
   if (v["dir"] !== undefined && typeof v["dir"] !== "string") return false;
   const depBumps = v["depBumps"];
   if (!isRecord(depBumps)) return false;
   for (const value of Object.values(depBumps)) {
-    if (typeof value !== "string") return false;
+    if (typeof value !== "string" || !SEMVER_RANGE.test(value)) return false;
   }
   return true;
+}
+
+/**
+ * Defence in depth behind `isChangesetEntry`'s format check: even a
+ * well-formed (plain-semver, in-range-syntax) entry must still be something
+ * the graph would actually produce. Re-derives the graph-dependent facts
+ * `applyEntry`/`openPrForEntry` trust — which repo owns `entry.pkg`,
+ * `toVersion`, and which packages `depBumps` may name — and rejects
+ * anything that disagrees.
+ *
+ * The `entry.repo === node.repo` check is not optional plumbing: `handlePrs`'s
+ * `foreign` check only confirms `entry.repo` is somewhere the *user* can act
+ * (a repo they own), never that `entry.repo` is where the graph actually
+ * says `entry.pkg` lives. Without this check here, a caller could pair a
+ * package name they merely know (possibly in a repo they cannot even see)
+ * with a repo of their own, and this route would happily branch, commit,
+ * and open a PR *on their own repo* carrying that other package's name and
+ * version — the App's write access narrowed to "repos the user can see",
+ * never to "repos the user can write", exactly the gap `ownedRepos`'s
+ * repo-visibility fix does not by itself close.
+ *
+ * Every message below is built only from values the caller already
+ * supplied (`entry.pkg`, `entry.repo`, `entry.toVersion`, a `depBumps` key)
+ * — never from a graph-derived value like `node.repo` or `node.version`.
+ * `entry.pkg` may name a real package in a repo the caller cannot see at
+ * all (see this module's doc comment on read-side scoping); echoing back
+ * *which* repo actually owns it, or its real current version, would turn
+ * this validator into an oracle for exactly the information Critical-1's
+ * read-side filtering exists to hide.
+ *
+ * Deliberately not a full re-run of `planUpdateOne`/`planUpdateChain`: this
+ * route receives one flat `entries[]` array with no `pkg`/`mode` telling it
+ * which planner (or which root) produced it, and a chain's later-level
+ * `depBumps` values are intentionally built from *other entries'* bumped
+ * versions rather than the graph's current ones (see `planUpdateChain`'s own
+ * doc comment) — replaying that sequencing here would mean reimplementing
+ * the planner just to re-validate its output. What *is* cheap and load-
+ * bearing to check, per package, against the graph alone:
+ *   - `entry.repo` is exactly the repo the graph says owns `entry.pkg`;
+ *   - `toVersion` is exactly `bumpPatch` of that package's current graph
+ *     version (true for every entry produced by either planner, at every
+ *     chain level, since each package always bumps its own current version);
+ *   - every `depBumps` key actually names an in-graph dependency (`deps` or
+ *     `devDeps`) of that package, so a key cannot be invented or pointed at
+ *     an unrelated package.
+ * This does not re-verify a chain-interior `depBumps` *value* against the
+ * exact bumped version a full replay would compute, but that value has
+ * already survived `isChangesetEntry`'s allowlist, so the worst it can be at
+ * this point is a syntactically valid but wrong version number for a
+ * genuine, in-graph dependency — not an arbitrary string.
+ */
+function validateEntriesAgainstGraph(
+  entries: ChangesetEntry[],
+  graph: Map<string, RepoNode>,
+): string | null {
+  for (const entry of entries) {
+    const node = graph.get(entry.pkg);
+    if (!node) {
+      return `${entry.pkg} is not in the dependency graph`;
+    }
+    if (node.repo !== entry.repo) {
+      return `${entry.pkg} does not belong to repo "${entry.repo}"`;
+    }
+    const expected = bumpPatch(node.version);
+    if (entry.toVersion !== expected) {
+      return `${entry.pkg}: toVersion "${entry.toVersion}" does not match the graph-derived bump for this package`;
+    }
+    const edges = new Set([...node.deps, ...(node.devDeps ?? [])]);
+    for (const dep of Object.keys(entry.depBumps)) {
+      if (!edges.has(dep)) {
+        return `${entry.pkg}: depBumps names "${dep}", which is not a dependency of ${entry.pkg} in the graph`;
+      }
+    }
+  }
+  return null;
 }
 
 function parseEntriesBody(raw: unknown): ChangesetEntry[] | null {
@@ -226,27 +363,106 @@ function parseTrainBody(raw: unknown): TrainRequestBody | null {
 // --- membership: never act on a repo the request names without checking ------
 
 /**
- * Fetches this installation's own repo list fresh and returns it as a
- * lookup — the one source of truth every mutating route below checks a
+ * Fetches *this signed-in user's* accessible repos within their installation
+ * — fresh, via `GET /user/installations/{id}/repositories` and the user's
+ * own OAuth token from `session.userToken` — and returns them as a lookup.
+ * This is the one source of truth every mutating route below checks a
  * client-supplied repo name against before acting on it. Mirrors
  * `assertInstallationMembership`'s "never trust the id/name alone, always
  * recheck against a fresh listing" shape, one layer down (repos within an
- * installation, rather than installations within a user).
+ * installation, rather than installations within a user) — and, like that
+ * function, deliberately never uses the App's own installation-wide token
+ * (see this module's doc comment for why that would be a confused deputy).
  */
-async function ownedRepos(apis: InstallationApis): Promise<Map<string, RepoRef>> {
-  const repos = await apis.githubApi.listRepos();
+async function ownedRepos(session: SessionPayload, fetchFn: typeof fetch): Promise<Map<string, RepoRef>> {
+  const repos = await listUserInstallationRepositories(session.userToken, session.installationId, fetchFn);
   return new Map(repos.map((r) => [r.fullName, r]));
+}
+
+/**
+ * Maps an `assertInstallationMembership` failure to a response: a
+ * verification failure (couldn't check at all) is retryable and reported at
+ * `retryableStatus`; a clean "no" is final and always a 403. Mirrors
+ * `membershipFailureStatus` in `src/server/index.ts` one layer down (a
+ * mutating API route rechecking membership mid-session, rather than login
+ * itself checking it once).
+ */
+function membershipErrorResponse(err: unknown, retryableStatus: number): Response {
+  const status = err instanceof Error && err.message === MEMBERSHIP_VERIFICATION_FAILED ? retryableStatus : 403;
+  return errorResponse(err, status);
+}
+
+/**
+ * Maps an `ownedRepos` failure to a response. `UserTokenRejectedError` is
+ * never a generic upstream failure: GitHub is saying the signed-in user's
+ * own token — the one embedded in their session cookie — no longer works
+ * (revoked, expired). That must read to the client as "you are effectively
+ * signed out, sign in again" (401), distinct from `otherStatus` (a
+ * transient/systemic failure worth retrying) — and it must never fall back
+ * to authorizing against some other, broader repo list just because this
+ * specific check failed.
+ */
+function ownedReposErrorResponse(err: unknown, otherStatus: number): Response {
+  if (err instanceof UserTokenRejectedError) {
+    return jsonResponse({ error: "session invalid — sign in again" }, 401);
+  }
+  return errorResponse(err, otherStatus);
+}
+
+/**
+ * Filters a full, App-scoped graph down to only the nodes whose `repo`
+ * belongs to `owned` — the read-side half of the same confused-deputy fix
+ * `ownedRepos` provides on the write side (see this module's doc comment).
+ * `GitHubGraphSource` itself must still walk the whole installation to
+ * compute correct dependency edges; this is what stops that full picture
+ * from ever reaching a response. `classifyEdges` (src/web/graphModel.ts)
+ * already drops any edge whose `to` package isn't present in the `nodes`
+ * array it's given, so calling it with the *filtered* node list (as every
+ * caller here does) is sufficient to also drop edges into a hidden package
+ * — there is no separate edge-filtering step to forget.
+ */
+function filterGraphToOwnedRepos(
+  graph: Map<string, RepoNode>,
+  owned: Map<string, RepoRef>,
+): Map<string, RepoNode> {
+  const visible = new Map<string, RepoNode>();
+  for (const [pkg, node] of graph) {
+    if (owned.has(node.repo)) visible.set(pkg, node);
+  }
+  return visible;
+}
+
+/** Same filtering as `filterGraphToOwnedRepos`, for the skipped-repo diagnostics list — a repo name the user can't see must not leak through there either. */
+function filterSkippedToOwnedRepos(skipped: SkippedRepo[], owned: Map<string, RepoRef>): SkippedRepo[] {
+  return skipped.filter((s) => owned.has(s.repo));
 }
 
 // --- route handlers ------------------------------------------------------------
 
-async function handleRepos(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
+async function handleRepos(
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+  session: SessionPayload,
+): Promise<Response> {
   let repos: RepoRef[];
   try {
     repos = await apis.githubApi.listRepos();
   } catch (err) {
     return errorResponse(err, 502);
   }
+
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+  // Filtered before assessRepo ever runs, not after: assessRepo issues 6+
+  // requests per repo, so this is also what stops a repo the user can't see
+  // from costing any work, not just from appearing in the response.
+  repos = repos.filter((r) => owned.has(r.fullName));
 
   const requiredChecks = await deps.requiredChecksFor(installationId);
 
@@ -272,7 +488,12 @@ async function handleRepos(apis: InstallationApis, deps: ApiDeps, installationId
   return jsonResponse({ repos: results });
 }
 
-async function handleGraph(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
+async function handleGraph(
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+  session: SessionPayload,
+): Promise<Response> {
   const scope = await deps.scopeFor(installationId);
   const source = new GitHubGraphSource(apis.githubApi, scope);
   let graph: Map<string, RepoNode>;
@@ -281,9 +502,20 @@ async function handleGraph(apis: InstallationApis, deps: ApiDeps, installationId
   } catch (err) {
     return errorResponse(err, 502);
   }
-  const nodes = [...graph.values()];
+
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+
+  const visibleGraph = filterGraphToOwnedRepos(graph, owned);
+  const nodes = [...visibleGraph.values()];
   const edges = classifyEdges(nodes);
-  return jsonResponse({ nodes, edges, skipped: source.skipped });
+  const skipped = filterSkippedToOwnedRepos(source.skipped, owned);
+  return jsonResponse({ nodes, edges, skipped });
 }
 
 async function handleUpdate(
@@ -291,6 +523,7 @@ async function handleUpdate(
   apis: InstallationApis,
   deps: ApiDeps,
   installationId: number,
+  session: SessionPayload,
 ): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseUpdateBody(raw);
@@ -307,7 +540,20 @@ async function handleUpdate(
     return errorResponse(err, 502);
   }
 
-  if (!graph.has(body.pkg)) {
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+
+  // `graph.has(body.pkg)` alone would tell an attacker "this package exists
+  // somewhere in the installation" even when its repo is one they cannot
+  // see — the same 404 covers both "genuinely unknown" and "exists, but not
+  // visible to you" so the two are indistinguishable from the response.
+  const node = graph.get(body.pkg);
+  if (!node || !owned.has(node.repo)) {
     return jsonResponse({ error: `unknown package: ${body.pkg}` }, 404);
   }
 
@@ -322,7 +568,14 @@ async function handleUpdate(
     return errorResponse(err, 400);
   }
 
-  return jsonResponse({ entries, skipped: source.skipped });
+  // The root package is visible, but a chain can walk into a downstream
+  // consumer elsewhere in the installation the user cannot see — never
+  // return a changeset entry (or a skipped-repo diagnostic) for a repo
+  // outside the user's own accessible list, same as /api/graph.
+  const visibleEntries = entries.filter((e) => owned.has(e.repo));
+  const skipped = filterSkippedToOwnedRepos(source.skipped, owned);
+
+  return jsonResponse({ entries: visibleEntries, skipped });
 }
 
 /**
@@ -367,18 +620,36 @@ async function openPrForEntry(
   return pr;
 }
 
-async function handlePrs(req: Request, apis: InstallationApis, _deps: ApiDeps): Promise<Response> {
+async function handlePrs(
+  req: Request,
+  apis: InstallationApis,
+  deps: ApiDeps,
+  session: SessionPayload,
+): Promise<Response> {
+  const installationId = session.installationId;
   const raw = await readJsonBody(req);
   const entries = parseEntriesBody(raw);
   if (!entries) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[] } (non-empty)" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all
+  // before doing anything else — a removed collaborator or a revoked
+  // installation must lose write access on their very next call, not just
+  // once their session cookie's own TTL runs out.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    return membershipErrorResponse(err, 502);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
   // Never open a PR against a repo the client named that isn't actually part
@@ -390,6 +661,30 @@ async function handlePrs(req: Request, apis: InstallationApis, _deps: ApiDeps): 
       { error: `not part of this installation: ${foreign.map((e) => e.repo).join(", ")}` },
       403,
     );
+  }
+
+  // Defence in depth behind isChangesetEntry's format check (see
+  // validateEntriesAgainstGraph's doc comment): a client-hand-built changeset
+  // that is syntactically valid and names only owned repos could still lie
+  // about which version to write. Re-derive the graph fresh and reject
+  // anything that disagrees with what it actually says.
+  const scope = await deps.scopeFor(installationId);
+  const source = new GitHubGraphSource(apis.githubApi, scope);
+  let graph: Map<string, RepoNode>;
+  try {
+    graph = await source.load();
+  } catch (err) {
+    return errorResponse(err, 502);
+  }
+
+  let mismatch: string | null;
+  try {
+    mismatch = validateEntriesAgainstGraph(entries, graph);
+  } catch (err) {
+    return errorResponse(err, 502);
+  }
+  if (mismatch !== null) {
+    return jsonResponse({ error: `changeset does not match the current dependency graph: ${mismatch}` }, 400);
   }
 
   const prsMap = new Map<string, number>();
@@ -422,29 +717,41 @@ async function handlePrs(req: Request, apis: InstallationApis, _deps: ApiDeps): 
   return jsonResponse({ prs: results });
 }
 
-async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps): Promise<Response> {
+async function handleMerge(req: Request, apis: InstallationApis, deps: ApiDeps, session: SessionPayload): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseMergeBody(raw);
   if (!body) {
     return jsonResponse({ error: "expected { repo: string, pr: number }" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all —
+  // see handlePrs's identical check for why this can't wait for the session
+  // cookie to simply expire.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    // Deliberately 503, not 502 (mirroring the ownedRepos failure below): a
+    // systemic problem, not this PR's.
+    return membershipErrorResponse(err, 503);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    // Deliberately 503, not 502: this is `ownedRepos` (a fresh `listRepos`
-    // call) failing before this merge attempt ever reaches `mergePr` — a
-    // systemic problem (the installation token exchange is broken, GitHub
-    // itself is unreachable) that has nothing to do with *this* PR. A
-    // caller that reads any non-2xx here as "this PR's merge failed" (the
-    // hosted web client does exactly that, deliberately, for the ordinary
-    // case below) would badge a perfectly healthy PR "failed" because the
-    // installation's credentials went bad — a confident, wrong, per-item
-    // diagnosis of what is actually an account-wide outage. Giving the two
-    // failure modes distinct statuses is what lets a caller tell them apart
-    // without parsing the message.
-    return errorResponse(err, 503);
+    // Deliberately 503, not 502: this is `ownedRepos` failing before this
+    // merge attempt ever reaches `mergePr` — a systemic problem (the user's
+    // token is broken, GitHub itself is unreachable) that has nothing to do
+    // with *this* PR. A caller that reads any non-2xx here as "this PR's
+    // merge failed" (the hosted web client does exactly that, deliberately,
+    // for the ordinary case below) would badge a perfectly healthy PR
+    // "failed" because an unrelated credential went bad — a confident,
+    // wrong, per-item diagnosis of what is actually an account-wide outage.
+    // Giving the two failure modes distinct statuses is what lets a caller
+    // tell them apart without parsing the message.
+    return ownedReposErrorResponse(err, 503);
   }
 
   if (!owned.has(body.repo)) {
@@ -464,18 +771,30 @@ async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps)
   return jsonResponse({ merged: true, repo: body.repo, pr: body.pr });
 }
 
-async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps, session: SessionPayload): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseTrainBody(raw);
   if (!body) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[], prs: Record<string, number> }" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all —
+  // see handlePrs's identical check for why this can't wait for the session
+  // cookie to simply expire. The Auto Merge train can run unattended for a
+  // while; this is the one point where a mid-run revocation gets noticed.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    return membershipErrorResponse(err, 502);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
   // Same membership check as /api/prs and /api/merge, applied to every repo
@@ -488,7 +807,6 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
     return jsonResponse({ error: `not part of this installation: ${foreign.join(", ")}` }, 403);
   }
 
-  const fetchFn = deps.fetchFn ?? fetch;
   const isResolvable = deps.isResolvable ?? defaultIsResolvable;
   const trainDeps: TrainDeps = {
     async mergePr(entry, pr) {
@@ -544,23 +862,32 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
  * (defaulting to a real npm registry lookup, overridden in every test so no
  * suite run ever makes a network call) — never the graph reload.
  */
-async function handlePublished(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handlePublished(
+  req: Request,
+  apis: InstallationApis,
+  deps: ApiDeps,
+  session: SessionPayload,
+): Promise<Response> {
   const raw = await readJsonBody(req);
   const entries = parseEntriesBody(raw);
   if (!entries) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[] } (non-empty)" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
-  // Same membership check as /api/prs, /api/merge and /api/train — a
+  // Same repo-ownership check as /api/prs, /api/merge and /api/train — a
   // tampered changeset body must not be able to make this route probe the
-  // registry on behalf of a repo outside this installation.
+  // registry on behalf of a repo outside this installation. (This route
+  // only reads a public registry, so unlike those three it does not also
+  // re-verify installation membership — see this module's doc comment.)
   const foreign = entries.filter((e) => !owned.has(e.repo));
   if (foreign.length > 0) {
     return jsonResponse(
@@ -569,7 +896,6 @@ async function handlePublished(req: Request, apis: InstallationApis, deps: ApiDe
     );
   }
 
-  const fetchFn = deps.fetchFn ?? fetch;
   const isResolvable = deps.isResolvable ?? defaultIsResolvable;
   const resolvable: string[] = [];
   for (const entry of entries) {
@@ -620,15 +946,21 @@ export async function handleApiRequest(
   // this line reads an installation id from the request itself.
   const apis = deps.apisFor(session.installationId);
 
-  if (url.pathname === "/api/repos" && req.method === "GET") return handleRepos(apis, deps, session.installationId);
-  if (url.pathname === "/api/graph" && req.method === "GET") return handleGraph(apis, deps, session.installationId);
-  if (url.pathname === "/api/update" && req.method === "POST") {
-    return handleUpdate(req, apis, deps, session.installationId);
+  if (url.pathname === "/api/repos" && req.method === "GET") {
+    return handleRepos(apis, deps, session.installationId, session);
   }
-  if (url.pathname === "/api/prs" && req.method === "POST") return handlePrs(req, apis, deps);
-  if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps);
-  if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps);
-  if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps);
+  if (url.pathname === "/api/graph" && req.method === "GET") {
+    return handleGraph(apis, deps, session.installationId, session);
+  }
+  if (url.pathname === "/api/update" && req.method === "POST") {
+    return handleUpdate(req, apis, deps, session.installationId, session);
+  }
+  if (url.pathname === "/api/prs" && req.method === "POST") {
+    return handlePrs(req, apis, deps, session);
+  }
+  if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps, session);
+  if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps, session);
+  if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps, session);
 
   return jsonResponse({ error: "not found" }, 404);
 }

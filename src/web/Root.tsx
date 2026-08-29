@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { ChangesetEntry, RepoNode } from "../graph/types";
 import { App } from "./App";
 import type { RefreshResult } from "./Updates";
-import { ApiError, createApiClient, type ApiClient, type RepoStatus } from "./apiClient";
+import { ApiError, createApiClient, type ApiClient, type RepoStatus, type SkippedRepo } from "./apiClient";
 
 export interface RootProps {
   /** Injected for tests; defaults to a real fetch-backed client (same-origin). */
@@ -12,7 +12,7 @@ export interface RootProps {
 type LoadState =
   | { status: "loading" }
   | { status: "error"; message: string; unauthorized: boolean }
-  | { status: "ready"; nodes: RepoNode[]; prepared: Record<string, boolean> };
+  | { status: "ready"; nodes: RepoNode[]; prepared: Record<string, boolean>; skipped: SkippedRepo[] };
 
 /**
  * `GET /api/repos` reports readiness keyed by repo full name; RepoList/App
@@ -56,7 +56,12 @@ export function Root({ client }: RootProps) {
       try {
         const [repos, graph] = await Promise.all([apiClient.getRepos(), apiClient.getGraph()]);
         if (cancelled) return;
-        setState({ status: "ready", nodes: graph.nodes, prepared: buildPrepared(repos, graph.nodes) });
+        setState({
+          status: "ready",
+          nodes: graph.nodes,
+          prepared: buildPrepared(repos, graph.nodes),
+          skipped: graph.skipped,
+        });
       } catch (err) {
         if (cancelled) return;
         const unauthorized = err instanceof ApiError && err.unauthorized;
@@ -84,16 +89,45 @@ export function Root({ client }: RootProps) {
       <div data-testid="root-error">
         <p data-testid="root-error-message">
           {state.unauthorized
-            ? "You've been signed out — sign in again to continue."
+            ? // A 401 here just as often means "never signed in" (a first-time
+              // visitor) as "session expired" — never assert the former, and
+              // always give an actual way forward: see CRITICAL 2 in the
+              // final-review report.
+              "Sign in with GitHub to see your repositories."
             : `Could not load ChainReaction: ${state.message}`}
         </p>
+        {state.unauthorized && (
+          <p>
+            <a href="/auth/login" data-testid="sign-in-link">
+              Sign in with GitHub
+            </a>
+          </p>
+        )}
       </div>
     );
   }
 
   const onPlanUpdate = (pkg: string) => apiClient.postUpdate(pkg, "one");
   const onPlanUpdateChain = (pkg: string) => apiClient.postUpdate(pkg, "chain");
-  const onOpenPrs = (entries: ChangesetEntry[]) => apiClient.postPrs(entries);
+
+  // handlePrs (src/server/api.ts) can fail mid-chain after some PRs already
+  // opened on GitHub — its 502 body carries `opened` for exactly that
+  // reason. Losing that list would leave the user with real, open PRs they
+  // don't know exist. `ApiError.message` alone is not enough here, so this
+  // folds `opened` into the thrown message rather than swallowing it —
+  // Updates.tsx already renders any thrown error's message as-is.
+  async function onOpenPrs(entries: ChangesetEntry[]): Promise<Map<string, number>> {
+    try {
+      return await apiClient.postPrs(entries);
+    } catch (err) {
+      if (err instanceof ApiError && err.opened && err.opened.length > 0) {
+        const openedList = err.opened.map((o) => `${o.repo} (PR #${o.pr})`).join(", ");
+        throw new Error(`${err.message} — PRs already opened before the failure: ${openedList}`);
+      }
+      throw err;
+    }
+  }
+
   const onAutoMerge = (entries: ChangesetEntry[], prs: Map<string, number>) =>
     apiClient.postTrain(entries, prs);
 
@@ -143,15 +177,28 @@ export function Root({ client }: RootProps) {
   }
 
   return (
-    <App
-      nodes={state.nodes}
-      prepared={state.prepared}
-      onPlanUpdate={onPlanUpdate}
-      onPlanUpdateChain={onPlanUpdateChain}
-      onOpenPrs={onOpenPrs}
-      onMerge={onMerge}
-      onAutoMerge={onAutoMerge}
-      onRefresh={onRefresh}
-    />
+    <>
+      {state.skipped.length > 0 && (
+        // A repo GitHubGraphSource couldn't parse a manifest for is a repo
+        // silently missing from the whole cascade if this is dropped on the
+        // floor — see IMPORTANT 3 in the final-review report.
+        <div data-testid="root-skipped">
+          <p data-testid="root-skipped-message">
+            {state.skipped.length} repo(s) could not be added to the dependency graph:{" "}
+            {state.skipped.map((s) => `${s.repo} (${s.reason})`).join("; ")}
+          </p>
+        </div>
+      )}
+      <App
+        nodes={state.nodes}
+        prepared={state.prepared}
+        onPlanUpdate={onPlanUpdate}
+        onPlanUpdateChain={onPlanUpdateChain}
+        onOpenPrs={onOpenPrs}
+        onMerge={onMerge}
+        onAutoMerge={onAutoMerge}
+        onRefresh={onRefresh}
+      />
+    </>
   );
 }

@@ -6,7 +6,6 @@ import { assessRepo, prepareRepo } from "../prepare/prepare";
 import { planCascade, type PreparedProvider } from "../plan/planCascade";
 import { createInstallationApiFactory, type ApiDeps } from "../server/api";
 import type { ServerDeps } from "../server/index";
-import { Cascade } from "../supervisor/state";
 import type { CliDeps } from "./main";
 import type { CliConfig, OAuthConfig } from "./config";
 import type { PrepareResult } from "../prepare/types";
@@ -92,18 +91,9 @@ export function realApiDeps(config: CliConfig, fetchFn: typeof fetch = fetch): A
  * substituted here — it is exactly the `OAuthConfig` the caller passes in,
  * so a caller that forgot to load it gets a compile error, not a server
  * quietly running with placeholder credentials.
- *
- * `cascade`/`entries`/`onApprove` wire the legacy SSE-driven supervisor
- * screen `src/server/index.ts` still carries for backward compatibility.
- * Nothing in this task gives it a client, so it is wired to an already-
- * empty, inert `Cascade` rather than inventing a settings/state store this
- * task doesn't call for.
  */
 export function realServerDeps(config: CliConfig, auth: OAuthConfig, fetchFn: typeof fetch = fetch): ServerDeps {
   return {
-    cascade: new Cascade([], 0),
-    entries: [],
-    onApprove: () => {},
     auth,
     fetchFn,
     api: realApiDeps(config, fetchFn),

@@ -321,10 +321,12 @@ test("chainreaction serve's real wiring end to end: a session signed with the lo
   const server = createServer(deps, 0);
   try {
     const sessions = new SessionStore(auth.sessionSecret);
-    const cookie = await sessions.createSession("user-1", cfg.installationId);
+    const cookie = await sessions.createSession("user-1", cfg.installationId, "user-1-github-token");
 
+    // auth.callbackUrl (from oauthConfig()) is https, so the session cookie
+    // requires the __Host- prefix — see src/server/index.ts's hostCookieName.
     const res = await fetch(`http://127.0.0.1:${server.port}/api/whoami`, {
-      headers: { cookie: `cr_session=${cookie}` },
+      headers: { cookie: `__Host-cr_session=${cookie}` },
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ userId: "user-1", installationId: cfg.installationId });
@@ -344,10 +346,10 @@ test("chainreaction serve's wiring rejects a session signed with a different sec
     // used a placeholder OAuthConfig instead of the one loadOAuthConfig
     // actually produced from the environment.
     const wrongSessions = new SessionStore("a-completely-different-secret");
-    const cookie = await wrongSessions.createSession("user-1", cfg.installationId);
+    const cookie = await wrongSessions.createSession("user-1", cfg.installationId, "user-1-github-token");
 
     const res = await fetch(`http://127.0.0.1:${server.port}/api/whoami`, {
-      headers: { cookie: `cr_session=${cookie}` },
+      headers: { cookie: `__Host-cr_session=${cookie}` },
     });
     expect(res.status).toBe(401);
   } finally {

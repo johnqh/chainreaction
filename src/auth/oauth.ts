@@ -1,3 +1,6 @@
+import { parseNextLink } from "../github/installationApi";
+import type { RepoRef } from "../graph/githubSource";
+
 const AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
 const API_ROOT = "https://api.github.com";
@@ -161,6 +164,86 @@ export async function assertInstallationMembership(
   return match;
 }
 
+interface RawUserRepo {
+  full_name: string;
+  private: boolean;
+  default_branch: string;
+}
+
+interface RawUserRepoListResponse {
+  repositories: RawUserRepo[];
+}
+
+/**
+ * Thrown when GitHub rejects the signed-in user's own access token outright
+ * (401/403) while listing an installation's user-scoped repositories — i.e.
+ * the token was revoked, expired, or is otherwise no longer good. Distinct
+ * from every other failure (network error, malformed body, a transient
+ * 5xx) so a caller can treat this one specifically as "this session is no
+ * longer valid, sign in again" — never as a generic upstream failure, and
+ * never as license to fall back to some broader, unauthorized repo list
+ * just because this specific check failed.
+ */
+export class UserTokenRejectedError extends Error {
+  constructor() {
+    super("the signed-in user's GitHub token was rejected");
+    this.name = "UserTokenRejectedError";
+  }
+}
+
+/**
+ * `GET /user/installations/{installationId}/repositories` — the
+ * repositories of `installationId` that *this specific user* (identified by
+ * `userToken`, a user-to-server OAuth token — never the App's own
+ * installation token) can actually access.
+ *
+ * This is the only correct source of truth for "which repos may this
+ * signed-in user act on". `GET /installation/repositories` (the App's own
+ * reach, fetched with the App's installation token — see
+ * `InstallationGitHubApi.listRepos`) answers a different question entirely:
+ * it lists every repo the *App* can reach, which GitHub grants access to as
+ * soon as *any* member of the installation's account can see *any* repo in
+ * it. Gating a specific user's mutations against that list is the
+ * confused-deputy bug this function exists to close — see `ownedRepos` in
+ * `src/server/api.ts`.
+ *
+ * Paginated the same way `InstallationGitHubApi.listRepos` is: GitHub's
+ * pagination is link-based, so `parseNextLink` (not `total_count`) is the
+ * only correct way to know whether another page exists.
+ */
+export async function listUserInstallationRepositories(
+  userToken: string,
+  installationId: number,
+  fetchFn: typeof fetch = fetch,
+): Promise<RepoRef[]> {
+  const repos: RepoRef[] = [];
+  let url: string | null = `${API_ROOT}/user/installations/${installationId}/repositories?per_page=100`;
+
+  while (url) {
+    const res: Response = await fetchFn(url, {
+      headers: { authorization: `Bearer ${userToken}`, accept: "application/vnd.github+json" },
+    });
+    if (res.status === 401 || res.status === 403) {
+      throw new UserTokenRejectedError();
+    }
+    if (!res.ok) {
+      throw new Error(`listUserInstallationRepositories failed: ${res.status}`);
+    }
+    const body = (await res.json()) as Partial<RawUserRepoListResponse>;
+    if (!Array.isArray(body.repositories)) {
+      throw new Error("listUserInstallationRepositories response is missing a repositories array");
+    }
+    for (const r of body.repositories) {
+      if (typeof r.full_name !== "string" || r.full_name.length === 0) {
+        throw new Error("listUserInstallationRepositories response contains a repository with no full_name");
+      }
+      repos.push({ fullName: r.full_name, private: r.private, defaultBranch: r.default_branch });
+    }
+    url = parseNextLink(res.headers.get("link"));
+  }
+  return repos;
+}
+
 /** `GET /user` — who the access token belongs to. */
 export async function getAuthenticatedUser(
   userToken: string,
@@ -206,6 +289,13 @@ export class OAuthStateStore {
   constructor(private now: () => number = () => Math.floor(Date.now() / 1000)) {}
 
   issue(): string {
+    // `GET /auth/login` is unauthenticated and cheap — nothing here ever
+    // deletes an entry except a matching `consume()`, so a login that is
+    // never followed through to a callback would otherwise sit in this map
+    // forever. Pruning on every insert bounds the map's size to roughly
+    // "states issued in the last OAUTH_STATE_TTL_SECONDS", regardless of how
+    // many logins are started and abandoned.
+    this.prune();
     const state = crypto.randomUUID();
     this.issued.set(state, this.now() + OAUTH_STATE_TTL_SECONDS);
     return state;
@@ -216,6 +306,18 @@ export class OAuthStateStore {
     const expiry = this.issued.get(state);
     this.issued.delete(state);
     return expiry !== undefined && expiry > this.now();
+  }
+
+  private prune(): void {
+    const now = this.now();
+    for (const [state, expiry] of this.issued) {
+      if (expiry <= now) this.issued.delete(state);
+    }
+  }
+
+  /** Test-only visibility into how many entries are currently held, to prove pruning actually bounds growth. */
+  get size(): number {
+    return this.issued.size;
   }
 }
 
@@ -261,6 +363,10 @@ export class PendingLoginStore {
   constructor(private now: () => number = () => Math.floor(Date.now() / 1000)) {}
 
   create(login: PendingLogin): string {
+    // Same unbounded-growth reasoning as `OAuthStateStore.issue` — a picker
+    // page that's rendered but never followed through to `/auth/choose`
+    // would otherwise hold its (login-bearing) entry forever.
+    this.prune();
     const id = crypto.randomUUID();
     this.pending.set(id, { login, expiry: this.now() + PENDING_LOGIN_TTL_SECONDS });
     return id;
@@ -272,5 +378,17 @@ export class PendingLoginStore {
     this.pending.delete(id);
     if (!entry || entry.expiry <= this.now()) return null;
     return entry.login;
+  }
+
+  private prune(): void {
+    const now = this.now();
+    for (const [id, entry] of this.pending) {
+      if (entry.expiry <= now) this.pending.delete(id);
+    }
+  }
+
+  /** Test-only visibility into how many entries are currently held, to prove pruning actually bounds growth. */
+  get size(): number {
+    return this.pending.size;
   }
 }

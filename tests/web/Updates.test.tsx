@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ChangesetEntry } from "../../src/graph/types";
 import type { TrainOutcome } from "../../src/pr/train";
+import type { SkippedRepo } from "../../src/web/apiClient";
 import { Updates, type RefreshResult, type UpdatesProps } from "../../src/web/Updates";
 
 afterEach(cleanup);
@@ -34,6 +35,11 @@ function chainEntries(): ChangesetEntry[] {
   ];
 }
 
+/** Wraps entries as the {entries, skipped} shape onPlanUpdate/onPlanUpdateChain resolve. */
+function planned(entries: ChangesetEntry[], skipped: SkippedRepo[] = []): { entries: ChangesetEntry[]; skipped: SkippedRepo[] } {
+  return { entries, skipped };
+}
+
 function prMap(): Map<string, number> {
   return new Map([
     ["acme/core", 101],
@@ -54,8 +60,8 @@ function calls<T extends unknown[], R>(impl: (...args: T) => R | Promise<R>) {
 function baseProps(overrides: Partial<UpdatesProps> = {}): UpdatesProps {
   return {
     selected: "app",
-    onPlanUpdate: async () => [],
-    onPlanUpdateChain: async () => [],
+    onPlanUpdate: async () => planned([]),
+    onPlanUpdateChain: async () => planned([]),
     onOpenPrs: async () => new Map(),
     onMerge: async () => true,
     onAutoMerge: async () => ({ status: "success", merged: [] }) as TrainOutcome,
@@ -74,8 +80,8 @@ test("plain Update calls onPlanUpdate, not onPlanUpdateChain, and proposes its r
   const updateEntries = [
     entry({ pkg: "app", repo: "acme/app", fromVersion: "2.0.0", toVersion: "2.0.1" }),
   ];
-  const planUpdate = calls(async (_pkg: string) => updateEntries);
-  const planChain = calls(async (_pkg: string) => chainEntries());
+  const planUpdate = calls(async (_pkg: string) => planned(updateEntries));
+  const planChain = calls(async (_pkg: string) => planned(chainEntries()));
   render(
     <Updates {...baseProps({ onPlanUpdate: planUpdate.fn, onPlanUpdateChain: planChain.fn })} />,
   );
@@ -92,7 +98,7 @@ test("plain Update calls onPlanUpdate, not onPlanUpdateChain, and proposes its r
 });
 
 test("Update Chain proposes the changeset and does NOT open any PR before confirmation", async () => {
-  const plan = calls(async (_pkg: string) => chainEntries());
+  const plan = calls(async (_pkg: string) => planned(chainEntries()));
   const open = calls(async (_entries: ChangesetEntry[]) => prMap());
   render(
     <Updates
@@ -115,11 +121,40 @@ test("Update Chain proposes the changeset and does NOT open any PR before confir
   expect(screen.queryByTestId("updates-open")).toBeNull();
 });
 
+// IMPORTANT 3: a repo whose manifest couldn't be parsed while planning is
+// silently missing from the whole cascade if this doesn't reach a pixel.
+test("skipped repos from planning are shown in the proposal, not silently dropped", async () => {
+  const skipped: SkippedRepo[] = [{ repo: "acme/broken", reason: "manifest has no name field" }];
+  render(
+    <Updates
+      {...baseProps({ onPlanUpdateChain: async () => planned(chainEntries(), skipped) })}
+    />,
+  );
+
+  fireEvent.click(screen.getByText("Update Chain"));
+
+  const notice = await screen.findByTestId("proposal-skipped");
+  expect(notice.textContent).toBe(
+    "1 repo(s) could not be planned and are missing from this proposal: acme/broken (manifest has no name field)",
+  );
+});
+
+test("no skipped notice is rendered when planning reports nothing skipped", async () => {
+  render(
+    <Updates {...baseProps({ onPlanUpdateChain: async () => planned(chainEntries()) })} />,
+  );
+
+  fireEvent.click(screen.getByText("Update Chain"));
+
+  await screen.findByTestId("updates-proposal");
+  expect(screen.queryByTestId("proposal-skipped")).toBeNull();
+});
+
 test("confirming opens exactly the proposed entries, once", async () => {
   const open = calls(async (_entries: ChangesetEntry[]) => prMap());
   render(
     <Updates
-      {...baseProps({ onPlanUpdateChain: async () => chainEntries(), onOpenPrs: open.fn })}
+      {...baseProps({ onPlanUpdateChain: async () => planned(chainEntries()), onOpenPrs: open.fn })}
     />,
   );
 
@@ -138,7 +173,7 @@ test("cancelling a proposal never opens any PR", async () => {
   const open = calls(async (_entries: ChangesetEntry[]) => prMap());
   render(
     <Updates
-      {...baseProps({ onPlanUpdateChain: async () => chainEntries(), onOpenPrs: open.fn })}
+      {...baseProps({ onPlanUpdateChain: async () => planned(chainEntries()), onOpenPrs: open.fn })}
     />,
   );
 
@@ -154,7 +189,7 @@ test("cancelling a proposal never opens any PR", async () => {
 async function renderOpen(overrides: Partial<UpdatesProps> = {}) {
   const utils = render(
     <Updates
-      {...baseProps({ onPlanUpdateChain: async () => chainEntries(), onOpenPrs: async () => prMap(), ...overrides })}
+      {...baseProps({ onPlanUpdateChain: async () => planned(chainEntries()), onOpenPrs: async () => prMap(), ...overrides })}
     />,
   );
   fireEvent.click(screen.getByText("Update Chain"));
@@ -192,9 +227,20 @@ test("a blocked PR names exactly what it is waiting for — no more, no less", a
   expect(screen.queryByTestId("merge-acme/app")).toBeNull();
 });
 
-test("merging the ready core PR unblocks app in the same render, still via classifyPr", async () => {
+// CRITICAL 1: merging is not publishing. Merging core's PR must NOT flip
+// `published` — that is the merge/publish race this product exists to
+// remove (see Root.tsx's own onRefresh doc comment and the sibling fix on
+// that path). Renamed and rewritten from the old (bugged) expectation that
+// merging alone unblocked `app` in the same render.
+test("merging the ready core PR leaves app blocked; only a Refresh reporting core published unblocks it", async () => {
   const merge = calls(async (_entry: ChangesetEntry, _pr: number) => true);
-  await renderOpen({ onMerge: merge.fn });
+  const refresh = calls(
+    async (_entries: ChangesetEntry[], _prs: Map<string, number>): Promise<RefreshResult> => ({
+      published: new Set(["core"]),
+      observed: {},
+    }),
+  );
+  await renderOpen({ onMerge: merge.fn, onRefresh: refresh.fn });
 
   fireEvent.click(screen.getByTestId("merge-acme/core"));
 
@@ -208,9 +254,24 @@ test("merging the ready core PR unblocks app in the same render, still via class
   expect(mergedEntry?.repo).toBe("acme/core");
   expect(prNumber).toBe(101);
 
+  // core's own row reflects the merge (an "observed" claim, not `published`)...
   expect(screen.getByTestId("pr-row-acme/core").getAttribute("data-state")).toBe("merged");
-  // app's in-chain dependency (core) is now published: app becomes ready.
-  expect(screen.getByTestId("pr-row-acme/app").getAttribute("data-state")).toBe("ready");
+  // ...but app must NOT go ready from the merge alone: nothing has checked
+  // whether core@1.0.1 is actually resolvable yet. A regression that
+  // re-adds `setPublished` inside `merge()` makes this assertion (and the
+  // next two) fail.
+  expect(screen.getByTestId("pr-row-acme/app").getAttribute("data-state")).toBe("blocked");
+  expect(screen.getByTestId("pr-waiting-acme/app").textContent).toBe(" — waiting for: core");
+  expect(screen.queryByTestId("merge-acme/app")).toBeNull();
+  expect(refresh.log.length).toBe(0);
+
+  // It only becomes ready once a Refresh actually reports core as published.
+  fireEvent.click(screen.getByTestId("refresh"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("pr-row-acme/app").getAttribute("data-state")).toBe("ready");
+  });
+  expect(refresh.log.length).toBe(1);
   expect(screen.queryByTestId("pr-waiting-acme/app")).toBeNull();
 });
 
@@ -262,9 +323,57 @@ test("Refresh pulls published/observed state and re-colours rows accordingly", a
   expect(screen.getByTestId("pr-row-acme/app").getAttribute("data-state")).toBe("ready");
 });
 
+// IMPORTANT 4: `observed` is a merge, not a replace. `onRefresh` only ever
+// reports "merged" (see RefreshResult's doc comment) — a previously
+// observed "failed" for a repo Refresh has nothing new to say about must
+// survive, not silently revert to ready/blocked.
+test("a 'failed' badge survives a Refresh that reports nothing new about that repo", async () => {
+  const merge = calls(async (_entry: ChangesetEntry, _pr: number) => false);
+  const refresh = calls(
+    async (): Promise<RefreshResult> => ({ published: new Set(), observed: {} }),
+  );
+  await renderOpen({ onMerge: merge.fn, onRefresh: refresh.fn });
+
+  // tool has no in-chain dependency: ready, so it has a Merge button.
+  fireEvent.click(screen.getByTestId("merge-acme/tool"));
+  await waitFor(() => {
+    expect(screen.getByTestId("pr-row-acme/tool").getAttribute("data-state")).toBe("failed");
+  });
+
+  fireEvent.click(screen.getByTestId("refresh"));
+  await waitFor(() => {
+    expect(refresh.log.length).toBe(1);
+  });
+  // A regression that replaces `observed` wholesale (`setObserved(result.observed)`)
+  // would revert this to "ready" the instant Refresh runs, since the mock's
+  // `observed` is empty.
+  expect(screen.getByTestId("pr-row-acme/tool").getAttribute("data-state")).toBe("failed");
+});
+
+test("a later 'merged' from Refresh overrides an earlier 'failed' for the same repo — merging is newer information", async () => {
+  const merge = calls(async (_entry: ChangesetEntry, _pr: number) => false);
+  const refresh = calls(
+    async (): Promise<RefreshResult> => ({
+      published: new Set(),
+      observed: { "acme/tool": "merged" },
+    }),
+  );
+  await renderOpen({ onMerge: merge.fn, onRefresh: refresh.fn });
+
+  fireEvent.click(screen.getByTestId("merge-acme/tool"));
+  await waitFor(() => {
+    expect(screen.getByTestId("pr-row-acme/tool").getAttribute("data-state")).toBe("failed");
+  });
+
+  fireEvent.click(screen.getByTestId("refresh"));
+  await waitFor(() => {
+    expect(screen.getByTestId("pr-row-acme/tool").getAttribute("data-state")).toBe("merged");
+  });
+});
+
 test("switching the selected repo abandons the in-flight proposal", async () => {
   const { rerender } = render(
-    <Updates {...baseProps({ selected: "app", onPlanUpdateChain: async () => chainEntries() })} />,
+    <Updates {...baseProps({ selected: "app", onPlanUpdateChain: async () => planned(chainEntries()) })} />,
   );
   fireEvent.click(screen.getByText("Update Chain"));
   await screen.findByTestId("updates-proposal");

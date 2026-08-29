@@ -281,3 +281,49 @@ test("PendingLoginStore: an unknown id is rejected", () => {
   const store = new PendingLoginStore(() => 1000);
   expect(store.consume("never-created")).toBeNull();
 });
+
+// --- Important G: unbounded growth via GET /auth/login (unauthenticated, ---
+// cheap, never itself deletes anything) — pruning on insert must bound size --
+
+test("OAuthStateStore: an expired, never-consumed entry does not accumulate — issuing after expiry keeps the map at one entry", () => {
+  let clock = 1000;
+  const store = new OAuthStateStore(() => clock);
+  store.issue(); // never consumed — simulates GET /auth/login with no follow-up callback
+  expect(store.size).toBe(1);
+  clock += 601; // past OAUTH_STATE_TTL_SECONDS
+  store.issue(); // the prune inside issue() must sweep the first, now-expired entry
+  expect(store.size).toBe(1);
+});
+
+test("OAuthStateStore: a large number of abandoned logins never grows the map past the states actually still live", () => {
+  let clock = 1000;
+  const store = new OAuthStateStore(() => clock);
+  for (let i = 0; i < 500; i++) {
+    store.issue(); // simulates a hostile loop hitting GET /auth/login repeatedly
+    clock += 1; // each issue is far enough apart that, once its TTL passes, it's prunable
+  }
+  clock += 601; // now every one of the 500 is expired
+  store.issue(); // one more issue: prunes all 500 expired entries, adds just this one
+  expect(store.size).toBe(1);
+});
+
+test("OAuthStateStore: pruning an expired entry never affects a still-live one issued around the same time", () => {
+  let clock = 1000;
+  const store = new OAuthStateStore(() => clock);
+  const early = store.issue();
+  clock += 601; // early is now expired
+  const late = store.issue(); // late is fresh; issuing this must prune `early` but keep `late`
+  expect(store.size).toBe(1);
+  expect(store.consume(late)).toBe(true);
+  expect(store.consume(early)).toBe(false);
+});
+
+test("PendingLoginStore: an expired, never-consumed entry does not accumulate", () => {
+  let clock = 1000;
+  const store = new PendingLoginStore(() => clock);
+  store.create({ userId: "1", userToken: "tok" }); // never consumed — an abandoned installation picker
+  expect(store.size).toBe(1);
+  clock += 301; // past PENDING_LOGIN_TTL_SECONDS
+  store.create({ userId: "2", userToken: "tok2" }); // must prune the first, now-expired entry
+  expect(store.size).toBe(1);
+});

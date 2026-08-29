@@ -87,3 +87,58 @@ test("topoLevels throws on a dependency cycle", () => {
   ]);
   expect(() => topoLevels(g, new Set(["a", "b"]))).toThrow(/cycle/i);
 });
+
+// --- peerDependencies / devDependencies edge-set pinning (Important E) --------
+//
+// `affectedSubgraph` answers "who must republish because this package
+// changed" and must follow `deps` (which scanRepos already folds
+// peerDependencies into) but never `devDeps` — a devDependency bump never
+// forces a dependent to republish. Nothing before this fixture exercised
+// either a `peerDependencies` or a `devDependencies` block, so none of these
+// three regressions would have failed a single test: `affectedSubgraph` also
+// following `devDeps`, `scanRepos` dropping `peerDependencies`, or
+// `GitHubGraphSource` dropping `peerDependencies` (see githubSource.test.ts
+// for that last one).
+function peerAndDevFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cr-peerdev-"));
+  const write = (dir: string, pkg: object) => {
+    mkdirSync(join(root, dir), { recursive: true });
+    writeFileSync(join(root, dir, "package.json"), JSON.stringify(pkg));
+  };
+  write("design_system", { name: "@acme/design", version: "1.0.0" });
+  // Its ONLY edge to @acme/design is a peerDependency — no `dependencies` entry.
+  write("peer_consumer", {
+    name: "@acme/peer-consumer", version: "1.0.0",
+    peerDependencies: { "@acme/design": "^1.0.0" },
+  });
+  // Its ONLY edge to @acme/design is a devDependency — no `dependencies` or
+  // `peerDependencies` entry.
+  write("dev_consumer", {
+    name: "@acme/dev-consumer", version: "1.0.0",
+    devDependencies: { "@acme/design": "^1.0.0" },
+  });
+  return root;
+}
+
+test("scanRepos folds peerDependencies into deps, and keeps devDependencies out of deps", () => {
+  const g = scanRepos(peerAndDevFixture(), "@acme/", "acme");
+  // Catches "scanRepos dropping peerDependencies": without the merge, this
+  // package's deps would be [] instead of naming its one real edge.
+  expect(g.get("@acme/peer-consumer")!.deps).toEqual(["@acme/design"]);
+  // A devDependency must never leak into `deps` — that would make a
+  // devDependency-only edge look like a real publish dependency everywhere
+  // `deps` is consulted (affectedSubgraph, topoLevels, classifyEdges).
+  expect(g.get("@acme/dev-consumer")!.deps).toEqual([]);
+  expect(g.get("@acme/dev-consumer")!.devDeps).toEqual(["@acme/design"]);
+});
+
+test("affectedSubgraph follows a peerDependency edge but not a devDependency edge", () => {
+  const g = scanRepos(peerAndDevFixture(), "@acme/", "acme");
+  const affected = affectedSubgraph(g, "@acme/design");
+  // Catches "scanRepos dropping peerDependencies" (peer-consumer would drop
+  // out) and "affectedSubgraph also following devDeps" (dev-consumer would
+  // wrongly appear).
+  expect(affected.has("@acme/peer-consumer")).toBe(true);
+  expect(affected.has("@acme/dev-consumer")).toBe(false);
+  expect([...affected].sort()).toEqual(["@acme/design", "@acme/peer-consumer"]);
+});

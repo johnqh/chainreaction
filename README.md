@@ -19,7 +19,20 @@ credentials.
 ChainReaction is installed as a GitHub App. It never sees a customer's npm credentials, and it never
 runs a customer's build or test commands on ChainReaction's own infrastructure — see below for why.
 
+ChainReaction also runs as a hosted, multi-tenant web app — see
+["Running the hosted app"](#running-the-hosted-app) below for the `serve` command, its required
+environment variables, and the two separate GitHub registrations it needs.
+
 ## Adding the validation workflow
+
+> **Status: this pillar is implemented but not yet wired up end to end.** The claim/exchange handler
+> described below (`handleClaim` in `src/validate/claim.ts`) exists and is unit-tested, but as of this
+> writing it is **mounted on no HTTP route** — there is no "ChainReaction control plane" endpoint
+> listening for it yet — and nothing in the CLI (`src/cli/bin.ts`) dispatches the
+> `chainreaction-validate` workflow that would call it. `src/validate/`, `src/oidc/`, and
+> `src/github/dispatch.ts` are unreachable from the CLI entry point today. Read the rest of this
+> section as the target design for the validation pillar, not a feature you can turn on by adding the
+> workflow file — adding it will not connect to anything yet.
 
 Every repository that takes part in a cascade needs one workflow file:
 [`docs/chainreaction-validate.yml`](docs/chainreaction-validate.yml). Copy it into your repository at:
@@ -93,11 +106,59 @@ job's `name:` field is only ever seen by a human reading your Actions log.
 `workflow_dispatch` trigger with its `cascade_id` input, the `id-token: write` permission, and that the
 claim response is never echoed — not the job name.
 
+## Running the hosted app
+
+`chainreaction serve` starts the multi-tenant web app: a developer signs in with GitHub, and the app
+acts as a GitHub App installation to open and merge pull requests across their repositories.
+
+Two separate GitHub registrations are required — they are not the same thing:
+
+- **A GitHub App.** This is the installation ChainReaction acts *as* when reading repo state and
+  opening/merging pull requests (`CR_APP_ID` / `CR_PRIVATE_KEY_PATH` below).
+- **A GitHub OAuth App.** This is used only for the "Sign in with GitHub" login flow
+  (`CR_OAUTH_CLIENT_ID` / `CR_OAUTH_CLIENT_SECRET` below). Its **callback URL**, as registered with
+  GitHub, must exactly match `CR_OAUTH_CALLBACK_URL`.
+
+### Environment variables
+
+Every variable below is read and validated by `src/cli/config.ts` (`loadConfig` for the first group,
+`loadOAuthConfig` for the second) — nothing here is inferred, defaulted, or optional unless noted.
+
+| Variable | Required for | What it is |
+| --- | --- | --- |
+| `CR_APP_ID` | every command | The GitHub App's numeric ID. |
+| `CR_PRIVATE_KEY_PATH` | every command | Filesystem path to the GitHub App's private key (`.pem`). Never appears in a log line or error — a read failure is reported by path only. |
+| `CR_INSTALLATION_ID` | `prepare`, `plan` | The numeric ID of the GitHub App installation to act on. **Loaded, but not used, by `serve`**: `loadConfig` is shared by every command and always requires this, but the hosted app resolves the installation from the signed-in session on each request, never from this variable. Running `serve` still needs some syntactically valid positive integer here — any placeholder value works — but its value has no effect on `serve`'s behavior. |
+| `CR_SCOPE` | every command | The npm package scope this installation manages, e.g. `@acme/`. |
+| `CR_REQUIRED_CHECKS` | every command | Comma-separated status check name(s) your own repos' CI already produces on pull requests, e.g. `build,test`. Never `chainreaction-validate` itself — see "The required status check is your own CI" above. `serve` uses this too (via `handleRepos` in `src/server/api.ts`), not just `prepare`/`plan`. |
+| `CR_OAUTH_CLIENT_ID` | `serve` | The GitHub OAuth App's client ID. |
+| `CR_OAUTH_CLIENT_SECRET` | `serve` | The GitHub OAuth App's client secret. Never logged. |
+| `CR_SESSION_SECRET` | `serve` | A random secret used to sign session cookies, e.g. the output of `openssl rand -hex 32`. Never logged. |
+| `CR_OAUTH_CALLBACK_URL` | `serve` | The full, absolute callback URL registered with the GitHub OAuth App, e.g. `https://app.example.com/auth/callback`. Use `https://` in any real deployment: an `http://` callback URL is a documented dev-only fallback (see `src/server/index.ts`) that drops the `__Host-` cookie name prefix and the `Secure` flag on every cookie the app sets. |
+
+All five `loadConfig` variables (`CR_APP_ID`, `CR_PRIVATE_KEY_PATH`, `CR_INSTALLATION_ID`, `CR_SCOPE`,
+`CR_REQUIRED_CHECKS`) are loaded unconditionally at startup regardless of which command you run
+(`loadConfig` runs once, before the command is dispatched), so all five must be set even to run `serve`
+alone — see `CR_INSTALLATION_ID` above for the one case where the value you set has no effect on the
+command you're actually running.
+
+### Starting it
+
+```sh
+cp .env.example .env   # then fill in the values described above
+bun run chainreaction serve
+```
+
+Bun automatically loads a `.env` file from the project root, so no separate loader step is needed.
+`serve` listens on `127.0.0.1:3737` and never returns during normal operation — stop it with Ctrl-C or
+your process manager.
+
 ## Development
 
 - Package manager: [Bun](https://bun.sh).
 - Install: `bun install`
-- Run the CLI: `bun run chainreaction <command>` (see `chainreaction --help` via the CLI itself for
-  `prepare` and `plan`)
+- Run the CLI: `bun run chainreaction <command>` — commands are `prepare`, `plan`, and `serve`. There is
+  no `--help` flag: running with no command, or one it doesn't recognize (including `--help`), prints
+  the usage text and exits with status **1**, not 0.
 - Test: `bun test tests/`
 - Typecheck: `bunx tsc --noEmit -p tsconfig.json`

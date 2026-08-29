@@ -119,3 +119,30 @@ test("one manifest request per repo, no duplicates", async () => {
   expect(a.manifestCalls.length).toBe(REPOS.length);
   expect(new Set(a.manifestCalls).size).toBe(REPOS.length);
 });
+
+// --- peerDependencies edge-set pinning (Important E) --------------------------
+//
+// No fixture above ever gave a manifest a `peerDependencies` block, so a
+// regression that dropped it from the `Object.keys({ ...dependencies,
+// ...peerDependencies })` merge (mirroring `scanRepos`) would have left this
+// whole suite green.
+test("peerDependencies are folded into deps, same as dependencies", async () => {
+  const repos: RepoRef[] = [
+    { fullName: "acme/design_system", private: false, defaultBranch: "main" },
+    { fullName: "acme/peer-consumer", private: false, defaultBranch: "main" },
+  ];
+  const manifests: Record<string, string> = {
+    "acme/design_system": JSON.stringify({ name: "@acme/design", version: "1.1.49" }),
+    // Its ONLY edge to @acme/design is a peerDependency.
+    "acme/peer-consumer": JSON.stringify({
+      name: "@acme/peer-consumer", version: "1.0.0",
+      peerDependencies: { "@acme/design": "^1.1.49" },
+    }),
+  };
+  const source = new GitHubGraphSource(
+    { listRepos: async () => repos, getManifest: async (f) => manifests[f] ?? null },
+    "@acme/",
+  );
+  const g = await source.load();
+  expect(g.get("@acme/peer-consumer")!.deps).toEqual(["@acme/design"]);
+});
