@@ -1,6 +1,7 @@
 import type { ChangesetEntry } from "../graph/types";
 import type { JwksCache } from "../oidc/jwks";
 import type { TokenStore } from "../auth/appAuth";
+import type { ValidationResult } from "../sandbox/workspace";
 
 /**
  * What a legitimate claimant receives: the cascade it is validating and the
@@ -18,6 +19,20 @@ export interface ValidationRequest {
 export interface ClaimResult {
   token: string;
   request: ValidationRequest;
+}
+
+/**
+ * What the runner (`src/validate/runner.ts`) hands back after assembling the
+ * changeset as one workspace, asserting it actually linked, and building and
+ * testing every affected package. `ok` is true only when every result in
+ * `results` is; a run that stops early on a build failure (see
+ * `runValidation`) still reports the packages it got to, in dependency
+ * order, so the failing one is always named.
+ */
+export interface ValidationOutcome {
+  cascadeId: string;
+  ok: boolean;
+  results: ValidationResult[];
 }
 
 /**
