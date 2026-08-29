@@ -214,6 +214,51 @@ test("rejects a token with a valid signature but a missing repository_id claim",
   ).rejects.toThrow(/repository_id/i);
 });
 
+test("rejects a token whose signature segment is not valid base64url", async () => {
+  const pair = await generateKeyPair();
+  const jwk = await jwkFor("key-1", pair.publicKey);
+  const { fetchFn } = stubFetch([[jwk]]);
+  const jwks = new JwksCache(fetchFn, JWKS_URI);
+  const header = b64urlJson({ alg: "RS256", kid: "key-1" });
+  const payload = b64urlJson(baseClaims());
+  // "!" and "$" are outside the base64url alphabet — atob throws on them raw.
+  const token = `${header}.${payload}.not!!valid$$signature`;
+
+  await expect(
+    verifyOidcToken(token, jwks, { audience: AUDIENCE, ownerId: OWNER_ID }, 1_000_000),
+  ).rejects.toThrow(/malformed|base64/i);
+});
+
+test("rejects a token whose nbf is in the future", async () => {
+  const pair = await generateKeyPair();
+  const jwk = await jwkFor("key-1", pair.publicKey);
+  const { fetchFn } = stubFetch([[jwk]]);
+  const jwks = new JwksCache(fetchFn, JWKS_URI);
+  const token = await signToken(
+    pair.privateKey, { alg: "RS256", kid: "key-1" }, baseClaims({ nbf: 1_000_500 }),
+  );
+
+  await expect(
+    verifyOidcToken(token, jwks, { audience: AUDIENCE, ownerId: OWNER_ID }, 1_000_000),
+  ).rejects.toThrow(/not.yet.valid|nbf/i);
+});
+
+test("rejects a token with only two segments", async () => {
+  const { fetchFn } = stubFetch([[]]);
+  const jwks = new JwksCache(fetchFn, JWKS_URI);
+  await expect(
+    verifyOidcToken("abc.def", jwks, { audience: AUDIENCE, ownerId: OWNER_ID }, 1_000_000),
+  ).rejects.toThrow(/three|segments|malformed/i);
+});
+
+test("rejects a token with four segments", async () => {
+  const { fetchFn } = stubFetch([[]]);
+  const jwks = new JwksCache(fetchFn, JWKS_URI);
+  await expect(
+    verifyOidcToken("abc.def.ghi.jkl", jwks, { audience: AUDIENCE, ownerId: OWNER_ID }, 1_000_000),
+  ).rejects.toThrow(/three|segments|malformed/i);
+});
+
 test("never includes the token in a thrown error, regardless of which check fails", async () => {
   const pair = await generateKeyPair();
   const attacker = await generateKeyPair();

@@ -27,6 +27,7 @@ export const GITHUB_OIDC_JWKS_URI = "https://token.actions.githubusercontent.com
  */
 export class JwksCache {
   private keys: Map<string, CryptoKey> | null = null;
+  private inFlight: Promise<Map<string, CryptoKey>> | null = null;
 
   constructor(
     private fetchFn: typeof fetch = fetch,
@@ -49,6 +50,24 @@ export class JwksCache {
   }
 
   private async load(): Promise<void> {
+    // Concurrent callers hitting a cold (or rotating) cache share one fetch
+    // in flight instead of each firing their own request at GitHub — the
+    // exact load shape N CI runs claiming simultaneously produces. Cleared
+    // in .finally() on both success and failure so a transient error cannot
+    // poison the cache with a permanently cached rejection.
+    const existing = this.inFlight;
+    if (existing) {
+      this.keys = await existing;
+      return;
+    }
+    const fetching = this.fetchAndParse().finally(() => {
+      this.inFlight = null;
+    });
+    this.inFlight = fetching;
+    this.keys = await fetching;
+  }
+
+  private async fetchAndParse(): Promise<Map<string, CryptoKey>> {
     const res = await this.fetchFn(this.jwksUri);
     if (!res.ok) {
       throw new Error(`oidc: key lookup failed — JWKS fetch returned status ${res.status}`);
@@ -69,6 +88,6 @@ export class JwksCache {
       );
       next.set(jwk.kid, key);
     }
-    this.keys = next;
+    return next;
   }
 }

@@ -84,7 +84,12 @@ export async function verifyOidcToken(
 
   const key = await jwks.keyFor(kid);
 
-  const signature = b64urlToBytes(sigSeg);
+  let signature: Uint8Array<ArrayBuffer>;
+  try {
+    signature = b64urlToBytes(sigSeg);
+  } catch {
+    throw new Error("oidc: malformed token — signature is not valid base64url");
+  }
   const signedInput = new TextEncoder().encode(`${headerSeg}.${payloadSeg}`);
   const validSignature = await crypto.subtle.verify(
     "RSASSA-PKCS1-v1_5",
@@ -123,7 +128,10 @@ export async function verifyOidcToken(
   }
 
   const nbf = payload["nbf"];
-  if (typeof nbf === "number" && nbf > now) {
+  if (typeof nbf !== "number") {
+    throw new Error("oidc: malformed token — missing nbf claim");
+  }
+  if (nbf > now) {
     throw new Error("oidc: not-before check failed — token is not yet valid");
   }
 
