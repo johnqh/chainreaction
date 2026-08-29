@@ -66,12 +66,46 @@ export class InstallationRepoAdminApi implements RepoAdminApi {
   }
 
   /**
-   * Walks every page of GET /repos/{full}/commits/{ref}/check-runs and
-   * returns the distinct check-run names seen. Follows the `Link` header
-   * (via `parseNextLink`, the same helper `InstallationGitHubApi.listRepos`
-   * and `ActionsValidator.findRun` use) rather than trusting `total_count`,
-   * for the same reason those callers do: a busy repo can have far more
-   * than one page of check-runs on its default branch's tip commit.
+   * The head commit SHA of the most recently updated pull request, or
+   * `null` if the repo has none. `state=all` so a repo whose only PRs are
+   * already merged or closed still yields one — those still had their CI
+   * run against a real PR head, which is exactly the surface being sampled.
+   */
+  async recentPrHeadSha(full: string): Promise<string | null> {
+    const res = await this.request(
+      `${API_ROOT}/repos/${full}/pulls?state=all&sort=updated&direction=desc&per_page=1`,
+    );
+    if (!res.ok) throw new Error(`recentPrHeadSha ${full} failed: ${res.status}`);
+    const body = (await res.json()) as unknown;
+    if (!Array.isArray(body)) {
+      throw new Error(`recentPrHeadSha ${full}: response is not an array`);
+    }
+    if (body.length === 0) return null;
+    const first = body[0] as Record<string, unknown> | null;
+    const head = (first?.["head"] ?? undefined) as Record<string, unknown> | undefined;
+    const sha = head?.["sha"];
+    if (typeof sha !== "string" || sha.length === 0) {
+      throw new Error(`recentPrHeadSha ${full}: response has no usable head.sha`);
+    }
+    return sha;
+  }
+
+  /**
+   * Walks every page of GET /repos/{full}/commits/{ref}/check-runs, then
+   * folds in GET /repos/{full}/commits/{ref}/status, and returns the union
+   * of distinct names seen. Two APIs because required-check contexts come
+   * from either: the Checks API (`check_runs[].name`, most modern CI) or
+   * the legacy Statuses API (`statuses[].context` — CircleCI, Buildkite,
+   * Jenkins and Travis all report through the latter, never the former, so
+   * skipping it would make Prepare reject every one of those contexts as
+   * "never observed" even though it is exactly what branch protection
+   * requires. The combined-status endpoint already folds in every status
+   * ever posted for the ref, so this is one extra request, not another
+   * paginated walk. Check-run pagination follows the `Link` header (via
+   * `parseNextLink`, the same helper `InstallationGitHubApi.listRepos` and
+   * `ActionsValidator.findRun` use) rather than trusting `total_count`, for
+   * the same reason those callers do: a busy ref can have far more than one
+   * page of check-runs.
    */
   async listCheckRuns(full: string, ref: string): Promise<string[]> {
     const names = new Set<string>();
@@ -94,6 +128,24 @@ export class InstallationRepoAdminApi implements RepoAdminApi {
       }
       url = parseNextLink(res.headers.get("link"));
     }
+
+    const statusRes = await this.request(`${API_ROOT}/repos/${full}/commits/${ref}/status`);
+    if (!statusRes.ok) {
+      throw new Error(`listCheckRuns ${full}@${ref}: status lookup failed: ${statusRes.status}`);
+    }
+    const statusBody = (await statusRes.json()) as Record<string, unknown>;
+    const statuses = statusBody["statuses"];
+    if (!Array.isArray(statuses)) {
+      throw new Error(`listCheckRuns ${full}@${ref}: response has no statuses array`);
+    }
+    for (const raw of statuses) {
+      const context = (raw as Record<string, unknown> | null)?.["context"];
+      if (typeof context !== "string" || context.length === 0) {
+        throw new Error(`listCheckRuns ${full}@${ref}: a status has no usable context`);
+      }
+      names.add(context);
+    }
+
     return [...names];
   }
 

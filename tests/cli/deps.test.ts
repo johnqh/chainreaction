@@ -59,10 +59,18 @@ function stubFetch(opts: { repos: string[]; manifests: Record<string, string> })
     if (/\/contents\/\.github\/workflows\//.test(url)) {
       return new Response("{}", { status: 200 }); // validation workflow present
     }
+    if (/\/pulls\?/.test(url)) {
+      // No PR on record -> probeRepo falls back to sampling the default
+      // branch, which is where this stub's check-runs response lives.
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
     if (/\/commits\/[^/]+\/check-runs/.test(url)) {
       // "ci" matches the requiredChecks every test in this file configures
       // below, so a repo probed here is observed as ready by default.
       return new Response(JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: "ci" }] }), { status: 200 });
+    }
+    if (/\/commits\/[^/]+\/status$/.test(url)) {
+      return new Response(JSON.stringify({ statuses: [] }), { status: 200 });
     }
     if (/\/branches\/[^/]+\/protection$/.test(url)) {
       if (method === "GET") {
@@ -191,8 +199,14 @@ test("the PreparedProvider probes repos sequentially, never more than one in fli
     if (/\/contents\/\.github\/workflows\//.test(url)) {
       return new Response("{}", { status: 200 }); // validation workflow present
     }
+    if (/\/pulls\?/.test(url)) {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
     if (/\/commits\/[^/]+\/check-runs/.test(url)) {
       return new Response(JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: "ci" }] }), { status: 200 });
+    }
+    if (/\/commits\/[^/]+\/status$/.test(url)) {
+      return new Response(JSON.stringify({ statuses: [] }), { status: 200 });
     }
     if (/\/branches\/[^/]+\/protection$/.test(url) && method === "GET") {
       return new Response(JSON.stringify({ message: "Branch not protected" }), { status: 404 });
@@ -239,6 +253,7 @@ test("the PreparedProvider handed to planCascade is called with exactly the repo
   expect(calls.some((c) => c.url.includes("acme/other/branches"))).toBe(false);
   expect(calls.some((c) => c.url.includes("acme/other/contents/.github"))).toBe(false);
   expect(calls.some((c) => c.url.includes("acme/other/commits"))).toBe(false);
+  expect(calls.some((c) => c.url.includes("acme/other/pulls"))).toBe(false);
 
   expect(calls.some((c) => c.method === "GET" && c.url.endsWith("/repos/acme/lib"))).toBe(true);
 });

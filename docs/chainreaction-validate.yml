@@ -13,15 +13,13 @@
 # This file's PATH — .github/workflows/chainreaction-validate.yml — is what
 # Prepare verifies exists on your default branch. That path must not change.
 #
-# The job name below (chainreaction-validate) is cosmetic: it is what a human
-# reads in the Actions log and in the run list, nothing more. It is NOT a
-# required status check — this workflow only ever runs via workflow_dispatch,
-# and a required status check is evaluated against a pull request's head
-# commit, which a dispatched run never attaches to. The status check your
-# branch protection actually requires is your own CI's existing check (e.g.
-# "build", "test", "ci") — set that via CR_REQUIRED_CHECKS, never the name of
-# this job. Rename this job freely; it changes nothing about how Prepare or
-# the cascade validates this repo.
+# The job name below (chainreaction-validate) is cosmetic — a human-readable
+# label in the Actions log, nothing more. It is NOT a required status check:
+# this workflow only runs via workflow_dispatch, and a required check is
+# evaluated against a pull request's head commit, which a dispatched run
+# never attaches to. Your required check is your own CI's existing one
+# (e.g. "build", "test", "ci"), set via CR_REQUIRED_CHECKS. Rename this job
+# freely; nothing here depends on its name.
 name: ChainReaction Validate
 
 on:
@@ -50,27 +48,39 @@ jobs:
     name: chainreaction-validate
     runs-on: ubuntu-latest
     steps:
-      - uses: oven-sh/setup-bun@v2
+      # Pinned to a commit, not the mutable `v2` tag — this runs before the
+      # claim below, in a job that goes on to hold a cascade-scoped token.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
-      # Requests this run's OIDC token and exchanges it at the control plane
-      # for a scoped, short-lived token plus the changeset to validate.
+      # Exchanges this run's OIDC token at the control plane for a scoped,
+      # short-lived token plus the changeset. The response is written
+      # straight to a file, never echoed or captured as a step output, and
+      # the token is masked the instant it's read back, before anything
+      # downstream can print it.
       #
-      # The exchange's response — which carries that token — is written
-      # straight to a file. It is never echoed to the log and never captured
-      # as a step output, and the token is masked the instant it is read
-      # back out of that file, before anything downstream gets a chance to
-      # print it.
+      # `cascade_id` travels through `env`, never spliced into `run:` text:
+      # `${{ }}` is substituted before bash ever sees this script, so
+      # interpolating it directly would let a crafted `cascade_id` execute
+      # as code in a job holding `id-token: write` and, moments later, a
+      # cascade-scoped token — never do that here or in any step added to
+      # this file. `jq -nc` then builds the JSON body with correct escaping.
       - name: Claim this cascade
+        env:
+          CASCADE_ID: ${{ inputs.cascade_id }}
         run: |
           set -euo pipefail
           oidc=$(curl -sS -H "authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$CR_AUDIENCE" | jq -r .value)
-          curl -sS -X POST "$CR_URL/api/ci/claim" \
+          curl -sS --fail-with-body -X POST "$CR_URL/api/ci/claim" \
             -H "authorization: Bearer $oidc" \
             -H "content-type: application/json" \
-            -d "{\"cascade_id\":\"${{ inputs.cascade_id }}\"}" \
+            -d "$(jq -nc --arg id "$CASCADE_ID" '{cascade_id:$id}')" \
             -o "$RUNNER_TEMP/chainreaction-claim.json"
-          token=$(jq -r .token "$RUNNER_TEMP/chainreaction-claim.json")
+          # `// empty` turns a missing/null `.token` into "", not the string
+          # "null" — masking "null" would redact that word everywhere else
+          # in the log, stack traces and JSON dumps included.
+          token=$(jq -r '.token // empty' "$RUNNER_TEMP/chainreaction-claim.json")
+          [ -n "$token" ] || { echo "claim returned no token"; exit 1; }
           echo "::add-mask::$token"
 
       # The claim file — still only on disk, never in a log or a step output

@@ -44,9 +44,9 @@ The workflow is short enough to read in full before you add it. In summary:
 
 - It only runs on `workflow_dispatch`, triggered by ChainReaction when your repo is picked to validate
   a cascade — it never runs on your own pushes or PRs.
-- It requests `permissions: id-token: write`, nothing else. That lets it ask GitHub for a short-lived
-  OIDC token identifying *this specific repository* — cryptographically signed by GitHub, not by
-  ChainReaction.
+- It requests `permissions: id-token: write` and `contents: read`, nothing else. `id-token: write` lets
+  it ask GitHub for a short-lived OIDC token identifying *this specific repository* — cryptographically
+  signed by GitHub, not by ChainReaction; `contents: read` is only what checking out the repo needs.
 - It exchanges that OIDC token at the ChainReaction control plane for a short-lived, scoped token plus
   the changeset to validate. **This workflow holds no secret of your own** — there is nothing to add
   to your repository's secrets, and nothing long-lived for anyone to steal from your CI configuration.
@@ -68,22 +68,30 @@ that never arrives, and **every** pull request to your repository — yours as m
 would become permanently unmergeable.
 
 The status check that actually gates merging is the one your repository's **own existing CI** already
-produces on pull requests (e.g. `build`, `test`, `ci`). Set that name via `CR_REQUIRED_CHECKS` when
-running ChainReaction's CLI — there is no default, on purpose, so this can never silently be filled in
-with the wrong check. **Prepare verifies the name you gave actually exists** — it lists the check-runs
-GitHub has reported on your default branch and blocks, naming what it found instead, if the one you
-configured has never appeared there. This is why a downstream cascade PR can start red: its manifest
-references a version not yet published, so its own CI fails at install; once the upstream package
-publishes and that PR is updated, the same CI re-runs and turns green. That red-then-green cycle, on
-your own CI's check, is the entire cascade mechanism — `chainreaction-validate`'s job name has no part
-in it, and you are free to rename it.
+produces on pull requests (e.g. `build`, `test`, `ci`, or a legacy-status context like
+`ci/circleci: build`). Set that name via `CR_REQUIRED_CHECKS` when running ChainReaction's CLI — there
+is no default, on purpose, so this can never silently be filled in with the wrong check.
 
-The job name and file path are still both worth getting right for a different reason: **Prepare checks
-for the file at the exact path** `.github/workflows/chainreaction-validate.yml` (see above) and won't
-proceed until it's there, and the job's `name:` field is only ever seen by a human reading your Actions
-log. `tests/validate/workflowTemplate.test.ts` asserts the properties that are actually load-bearing —
-the `workflow_dispatch` trigger with its `cascade_id` input, the `id-token: write` permission, and that
-the claim response is never echoed — not the job name.
+**Prepare verifies the name you gave actually exists**, and it samples the right commit to check that
+against: required status checks are evaluated against a pull request's **head commit**, not your
+default branch tip, so Prepare looks at the head commit of your repository's most recently updated pull
+request (falling back to the default branch tip only if the repo has never had one). It blocks — naming
+what it found instead — if the check you configured has never been reported there. Sampling the default
+branch instead would get this backwards in both directions: it would accept `chainreaction-validate`
+itself as "observed" (its dispatched runs land on the default branch, not a PR head) and reject a
+perfectly correct `ci` that only ever runs on PRs.
+
+This is why a downstream cascade PR can start red: its manifest references a version not yet published,
+so its own CI fails at install; once the upstream package publishes and that PR is updated, the same CI
+re-runs and turns green. That red-then-green cycle, on your own CI's check, is the entire cascade
+mechanism — `chainreaction-validate`'s job name has no part in it, and you are free to rename it.
+
+**The file path is what Prepare verifies**, not the job name: it checks for the file at the exact path
+`.github/workflows/chainreaction-validate.yml` (see above) and won't proceed until it's there. The
+job's `name:` field is only ever seen by a human reading your Actions log.
+`tests/validate/workflowTemplate.test.ts` asserts the properties that are actually load-bearing — the
+`workflow_dispatch` trigger with its `cascade_id` input, the `id-token: write` permission, and that the
+claim response is never echoed — not the job name.
 
 ## Development
 

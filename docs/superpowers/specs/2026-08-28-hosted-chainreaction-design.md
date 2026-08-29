@@ -188,20 +188,27 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@<pinned-sha> # v2.x.y
       - name: Exchange OIDC token for a scoped checkout token
         id: auth
+        env:
+          CR_URL: https://chainreaction.dev
+          CASCADE_ID: ${{ inputs.cascade_id }}
         run: |
           OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=chainreaction" | jq -r .value)
-          curl -sS -X POST "$CR_URL/api/ci/claim" \
+          curl -sS --fail-with-body -X POST "$CR_URL/api/ci/claim" \
             -H "authorization: Bearer $OIDC" \
-            -d "{\"cascade_id\":\"${{ inputs.cascade_id }}\"}" -o /tmp/cr.json
-        env:
-          CR_URL: https://chainreaction.dev
+            -d "$(jq -nc --arg id "$CASCADE_ID" '{cascade_id:$id}')" -o /tmp/cr.json
       - name: Assemble the workspace and validate
         run: bunx @chainreaction/validate /tmp/cr.json
 ```
+
+`cascade_id` travels through `env`, never spliced into `run:` text — `${{ }}` is substituted before
+bash ever sees the script, so interpolating it directly would let a crafted `cascade_id` execute as
+code in a job holding `id-token: write`. `jq -nc` then builds the JSON body with correct escaping.
+See the shipped template (`docs/chainreaction-validate.yml`) for the full, hardened version, including
+`--fail-with-body` and a guard against masking a literal `"null"` when the claim has no token.
 
 **Verifying the OIDC token — measured, not assumed.** Discovery lives at
 `https://token.actions.githubusercontent.com/.well-known/openid-configuration`; the issuer is that

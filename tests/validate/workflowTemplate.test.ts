@@ -34,6 +34,26 @@ function theJob() {
   return { key, job };
 }
 
+/**
+ * Every double-quoted argument passed to `echo` in the raw template text.
+ * Line-level "does this line contain both /echo/ and /$token/" heuristics
+ * false-positive on lines like `[ -n "$token" ] || { echo "no token"; }`,
+ * where the two just happen to share a line without the echo ever touching
+ * the credential. Extracting the actual echoed string is precise instead.
+ */
+function echoedStrings(text: string): string[] {
+  return [...text.matchAll(/\becho\s+"([^"]*)"/g)].map((m) => m[1]!);
+}
+
+/** Echoed strings that reference the claimed token or the OIDC token — a
+ *  live, cascade-claimable credential for the run's remaining lifetime —
+ *  other than the one line that's supposed to (the `::add-mask::` line). */
+function leakyEchoes(text: string): string[] {
+  return echoedStrings(text).filter(
+    (s) => /\$\{?(token|oidc)\b/.test(s) && !s.startsWith("::add-mask::"),
+  );
+}
+
 test("the template parses as YAML", () => {
   expect(doc.jobs).toBeDefined();
 });
@@ -51,12 +71,7 @@ test("still triggers on workflow_dispatch with a required cascade_id string inpu
 
   expect(raw).not.toMatch(/GITHUB_OUTPUT/);
   expect(raw).not.toMatch(/::set-output::/);
-  const echoLinesWithToken = raw
-    .split("\n")
-    .filter((line) => /\becho\b/.test(line) && /\$\{?token\b/.test(line));
-  for (const line of echoLinesWithToken) {
-    expect(line).toContain("::add-mask::");
-  }
+  expect(leakyEchoes(raw)).toEqual([]);
 });
 
 test("DEFAULT_WORKFLOW_PATH still points at .github/workflows/<this file's name>", () => {
@@ -87,8 +102,58 @@ test("masks the claimed token as soon as it is read, before any later step", () 
   expect(raw).toContain("::add-mask::$token");
 });
 
-test("never runs with -x (would echo the exchange commands, token included, live to the log)", () => {
-  expect(raw).not.toMatch(/set\s+[a-z-]*x[a-z-]*\b/);
+test("the claim POST checks its own status — --fail-with-body, not a silent -o on a 4xx/5xx", () => {
+  // `curl -o file` alone exits 0 even on a 403/500: the error body lands in
+  // the file exactly like a real claim, `jq -r .token` on it yields "null",
+  // and the run limps on to fail confusingly deep inside the validator
+  // instead of failing here with the actual cause.
+  expect(raw).toMatch(/curl\s[^\n]*--fail-with-body[^\n]*\/api\/ci\/claim/);
+});
+
+test("guards against masking a literal \"null\" when the claim carries no token", () => {
+  // `jq -r .token` on a body with no `token` field yields the 4-character
+  // string "null", and `::add-mask::null` would tell the runner to redact
+  // every occurrence of that word for the rest of the log — stack traces
+  // and JSON dumps included. `// empty` plus a non-empty check keeps a
+  // missing token from ever reaching `::add-mask::`.
+  expect(raw).toMatch(/jq\s+-r\s+'\.token\s*\/\/\s*empty'/);
+  expect(raw).toMatch(/\[\s*-n\s*"\$token"\s*\]/);
+});
+
+test("pins setup-bun to a full commit SHA, not a mutable tag", () => {
+  // This step runs before the claim, in a job that goes on to hold a
+  // cascade-scoped token — a mutable tag (even `@v2`) is something the
+  // action's own maintainer account could repoint to shim `bunx` itself.
+  expect(raw).toMatch(/uses:\s*oven-sh\/setup-bun@[0-9a-f]{40}\s*#/);
+  expect(raw).not.toMatch(/uses:\s*oven-sh\/setup-bun@v\d/);
+});
+
+test("never enables shell tracing anywhere — set -x, set -o xtrace, bash -x, or a -x shebang would " +
+  "all echo the exchange commands, token included, live to the log", () => {
+  expect(raw).not.toMatch(/\bset\s+-[a-z-]*x[a-z-]*\b/i); // set -x, set -ex, set -xeuo pipefail, ...
+  expect(raw).not.toMatch(/\bset\s+-o\s+xtrace\b/i); // the long form of the same flag
+  expect(raw).not.toMatch(/\bbash\s+-[a-z-]*x[a-z-]*\b/i); // an explicit `bash -x script.sh` invocation
+  expect(raw).not.toMatch(/^#!.*-[a-z-]*x[a-z-]*\b/im); // a shebang requesting tracing
+  expect(raw).not.toMatch(/shell:\s*["']?[^\n]*-[a-z-]*x[a-z-]*[^\n]*\{0\}/i); // a traced custom `shell:`
+});
+
+test("no run: block interpolates a workflow expression — an input must travel through env:, never be " +
+  "spliced into shell text", () => {
+  // `${{ }}` is substituted by the runner before bash ever sees the script,
+  // so any occurrence inside a `run:` block turns whatever it expands to
+  // into code executed in this job — which holds `id-token: write` and,
+  // moments later, a cascade-scoped token spanning the whole cascade.
+  // `cascade_id` (an attacker-controlled workflow_dispatch input) and
+  // anything else the runner substitutes must reach the script only via a
+  // step's `env:`, never a direct splice into `run:`.
+  const jobs = doc.jobs ?? {};
+  const runBlocks = Object.values(jobs).flatMap((job) =>
+    (job.steps ?? []).map((s) => s["run"]).filter((r): r is string => typeof r === "string"),
+  );
+  expect(runBlocks.length).toBeGreaterThan(0); // sanity: this template does have run: steps
+  for (const run of runBlocks) {
+    expect(run).not.toContain("${{");
+  }
 });
 
 test("never pipes the claim response through jq into a visible step output", () => {
@@ -102,16 +167,12 @@ test("never pipes the claim response through jq into a visible step output", () 
   expect(raw).not.toMatch(/::set-output::/);
 });
 
-test("never echoes or cats the claim response, other than the add-mask line", () => {
-  // Any line that mentions the token AND `echo` must be the masking line
-  // itself — an `echo "$token"` (or similar) anywhere else would print the
-  // token to the log in plain sight.
-  const echoLinesWithToken = raw
-    .split("\n")
-    .filter((line) => /\becho\b/.test(line) && /\$\{?token\b/.test(line));
-  for (const line of echoLinesWithToken) {
-    expect(line).toContain("::add-mask::");
-  }
+test("never echoes or cats the claim response or the OIDC token, other than the add-mask line", () => {
+  // Any line that mentions a credential (the claimed token, or the OIDC
+  // token traded for it — itself live and cascade-claimable) AND `echo`
+  // must be the masking line itself — an `echo "$token"`, `echo "$oidc"`
+  // (or similar) anywhere else would print it to the log in plain sight.
+  expect(leakyEchoes(raw)).toEqual([]);
   expect(raw).not.toMatch(/\bcat\b[^\n]*chainreaction-claim\.json/);
 });
 
