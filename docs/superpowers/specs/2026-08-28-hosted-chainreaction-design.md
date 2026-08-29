@@ -203,6 +203,19 @@ jobs:
         run: bunx @chainreaction/validate /tmp/cr.json
 ```
 
+**Verifying the OIDC token — measured, not assumed.** Discovery lives at
+`https://token.actions.githubusercontent.com/.well-known/openid-configuration`; the issuer is that
+same URL, `jwks_uri` is `.../.well-known/jwks`, and the only signing algorithm offered is **RS256**.
+The JWKS currently carries **4 keys**, each with its own `kid`, so verification must select by `kid`
+rather than trying one key — and because GitHub rotates them, the control plane should cache the set
+and refetch when it sees an unknown `kid`, not on a fixed timer.
+
+**Validate against `repository_id` and `repository_owner_id`, not `repository` and
+`repository_owner`.** Both pairs are in `claims_supported`, but the name-based claims are mutable: a
+repository can be renamed or transferred, and a name freed by a deletion can be claimed by someone
+else. The numeric ids cannot. A control plane that authorises a checkout token on a name match is
+one rename away from handing an installation-scoped token to the wrong repository.
+
 The heavy lifting lives in a published `@chainreaction/validate` package rather than inline YAML, so
 the file customers paste stays short enough to read and audit, and fixes ship without asking 60 repos
 to update a workflow.
