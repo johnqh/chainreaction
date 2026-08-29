@@ -3,8 +3,8 @@ import { bumpPatch, computeChangeset, assertScoped } from "../../src/graph/chang
 import type { RepoNode } from "../../src/graph/types";
 
 const graph = new Map<string, RepoNode>([
-  ["@sudobility/design", { pkg: "@sudobility/design", dir: "/design_system", repo: "johnqh/design_system", version: "1.1.49", deps: [] }],
-  ["@sudobility/components", { pkg: "@sudobility/components", dir: "/mail_box_components", repo: "johnqh/mail_box_components", version: "5.3.13", deps: ["@sudobility/design"] }],
+  ["@acme/design", { pkg: "@acme/design", dir: "/design_system", repo: "acme/design_system", version: "1.1.49", deps: [] }],
+  ["@acme/components", { pkg: "@acme/components", dir: "/mail_box_components", repo: "acme/mail_box_components", version: "5.3.13", deps: ["@acme/design"] }],
 ]);
 
 test("bumpPatch increments the patch segment", () => {
@@ -18,16 +18,16 @@ test("bumpPatch rejects a non-semver version", () => {
 });
 
 test("computeChangeset bumps each package and rewrites in-subgraph dep ranges", () => {
-  const levels = [["@sudobility/design"], ["@sudobility/components"]];
+  const levels = [["@acme/design"], ["@acme/components"]];
   const cs = computeChangeset(graph, levels);
 
   expect(cs[0]).toMatchObject({
-    pkg: "@sudobility/design", fromVersion: "1.1.49", toVersion: "1.1.50",
+    pkg: "@acme/design", fromVersion: "1.1.49", toVersion: "1.1.50",
     depBumps: {}, level: 0,
   });
   expect(cs[1]).toMatchObject({
-    pkg: "@sudobility/components", fromVersion: "5.3.13", toVersion: "5.3.14",
-    depBumps: { "@sudobility/design": "^1.1.50" }, level: 1,
+    pkg: "@acme/components", fromVersion: "5.3.13", toVersion: "5.3.14",
+    depBumps: { "@acme/design": "^1.1.50" }, level: 1,
   });
 });
 

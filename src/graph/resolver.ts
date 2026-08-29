@@ -2,10 +2,11 @@ import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import type { RepoNode } from "./types";
 
-const SCOPE = "@sudobility/";
-const ORG = "johnqh";
-
-export function scanRepos(root: string): Map<string, RepoNode> {
+export function scanRepos(
+  root: string,
+  scope: string,
+  org: string,
+): Map<string, RepoNode> {
   const graph = new Map<string, RepoNode>();
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -27,17 +28,17 @@ export function scanRepos(root: string): Map<string, RepoNode> {
     if (!pkg?.name) continue;
 
     const deps = Object.keys({ ...pkg.dependencies, ...pkg.peerDependencies })
-      .filter((d) => d.startsWith(SCOPE))
+      .filter((d) => d.startsWith(scope))
       .sort();
 
     const devDeps = Object.keys({ ...pkg.devDependencies })
-      .filter((d) => d.startsWith(SCOPE))
+      .filter((d) => d.startsWith(scope))
       .sort();
 
     graph.set(pkg.name, {
       pkg: pkg.name,
       dir,
-      repo: `${ORG}/${basename(dir)}`,
+      repo: `${org}/${basename(dir)}`,
       version: pkg.version ?? "0.0.0",
       deps,
       devDeps,
