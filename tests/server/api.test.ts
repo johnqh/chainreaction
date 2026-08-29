@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { handleApiRequest, type ApiDeps, type InstallationApis, type InstallationApiFactory } from "../../src/server/api";
 import type { SessionPayload } from "../../src/auth/session";
+import { MEMBERSHIP_VERIFICATION_FAILED } from "../../src/auth/oauth";
 import type { GitHubApi, RepoRef } from "../../src/graph/githubSource";
 import type { RepoAdminApi, RepoMeta, ProtectionProbe } from "../../src/prepare/adminApi";
 import type { PrApi } from "../../src/github/prApi";
@@ -8,14 +9,22 @@ import type { ChangesetEntry } from "../../src/graph/types";
 
 // --- fakes ---------------------------------------------------------------------
 
+// The App's own installation-wide reach (used only for graph-building and
+// readiness assessment — `apis.githubApi.listRepos()`, fetched with the
+// App's installation token). Deliberately named separately from the user-
+// scoped repos below: the whole point of Critical-C's fix is that these two
+// lists can legitimately differ, and authorization must only ever follow
+// the user-scoped one.
+const DEFAULT_REPOS: RepoRef[] = [
+  { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+  { fullName: "acme/components", private: true, defaultBranch: "trunk" },
+];
+
 function fakeGitHubApi(opts: {
   repos?: RepoRef[];
   manifests?: Record<string, string | null>;
 } = {}): { api: GitHubApi; calls: string[] } {
-  const repos = opts.repos ?? [
-    { fullName: "acme/design", private: false, defaultBranch: "trunk" },
-    { fullName: "acme/components", private: true, defaultBranch: "trunk" },
-  ];
+  const repos = opts.repos ?? DEFAULT_REPOS;
   const manifests = opts.manifests ?? {
     "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
     "acme/components": JSON.stringify({
@@ -117,6 +126,63 @@ function factoryFor(apis: InstallationApis): { factory: InstallationApiFactory; 
   return { factory, calls };
 }
 
+const DEFAULT_INSTALLATION_ID = 42;
+const DEFAULT_USER_TOKEN = "user-oauth-token-abc123";
+
+/**
+ * A fetch double for the two user-token-authenticated GitHub endpoints
+ * Critical-C's fix (and Important-H's membership recheck) depend on:
+ * `GET /user/installations` (membership — `assertInstallationMembership`)
+ * and `GET /user/installations/{id}/repositories` (the user's own
+ * accessible repos — `ownedRepos`). Deliberately never answers
+ * `/installation/repositories` (the App-token endpoint `fakeGitHubApi`
+ * serves) — the two are never the same call, and a route that accidentally
+ * used the wrong one would hit this double's 404 fallthrough.
+ */
+function userScopedFetch(
+  opts: {
+    installationId?: number;
+    /** The repos *this user* can access within the installation — may deliberately differ from fakeGitHubApi's repos. */
+    repos?: RepoRef[];
+    /** Installation ids this user belongs to at all, for the membership recheck. Defaults to just `installationId`. */
+    memberOf?: number[];
+    /** Simulate GitHub rejecting the repos call outright (401/403) — Critical-C's "sign out, don't fall back" case. */
+    reposRejected?: boolean;
+    /** Simulate some other non-2xx failure fetching repos (a systemic outage, not a rejected token). */
+    reposFailStatus?: number;
+    /** Simulate the membership check itself failing (a verification failure, not a clean non-member). */
+    membershipFailStatus?: number;
+  } = {},
+): { fetchFn: typeof fetch; calls: string[] } {
+  const installationId = opts.installationId ?? DEFAULT_INSTALLATION_ID;
+  const repos = opts.repos ?? DEFAULT_REPOS;
+  const memberOf = opts.memberOf ?? [installationId];
+  const calls: string[] = [];
+  const fetchFn = (async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    calls.push(url);
+    if (url.startsWith(`https://api.github.com/user/installations/${installationId}/repositories`)) {
+      if (opts.reposRejected) return new Response("token rejected", { status: 403 });
+      if (opts.reposFailStatus) return new Response("upstream failure", { status: opts.reposFailStatus });
+      return new Response(
+        JSON.stringify({
+          repositories: repos.map((r) => ({ full_name: r.fullName, private: r.private, default_branch: r.defaultBranch })),
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.startsWith("https://api.github.com/user/installations")) {
+      if (opts.membershipFailStatus) return new Response("upstream failure", { status: opts.membershipFailStatus });
+      return new Response(
+        JSON.stringify({ installations: memberOf.map((id) => ({ id, account: { login: "acme" } })) }),
+        { status: 200 },
+      );
+    }
+    return new Response("unexpected request in test double: " + url, { status: 404 });
+  }) as unknown as typeof fetch;
+  return { fetchFn, calls };
+}
+
 function baseDeps(over: Partial<ApiDeps> = {}): ApiDeps {
   const { factory } = factoryFor(makeApis());
   return {
@@ -125,12 +191,13 @@ function baseDeps(over: Partial<ApiDeps> = {}): ApiDeps {
     requiredChecksFor: () => ["ci"],
     isResolvable: async () => true,
     sleep: async () => {},
+    fetchFn: userScopedFetch().fetchFn,
     ...over,
   };
 }
 
-function session(installationId = 42): SessionPayload {
-  return { userId: "555", installationId, exp: Number.MAX_SAFE_INTEGER };
+function session(installationId = DEFAULT_INSTALLATION_ID): SessionPayload {
+  return { userId: "555", installationId, userToken: DEFAULT_USER_TOKEN, exp: Number.MAX_SAFE_INTEGER };
 }
 
 function req(path: string, init?: RequestInit): { req: Request; url: URL } {
@@ -350,12 +417,13 @@ test("POST /api/prs commits a manifest with the bumped version and every depBump
   // worked example uses. If applyEntry stops rewriting devDependencies, this
   // is the fixture that catches it: the components/dependencies assertion
   // alone would not, since that block was never broken.
+  const repos: RepoRef[] = [
+    { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+    { fullName: "acme/components", private: false, defaultBranch: "trunk" },
+    { fullName: "acme/toolkit", private: false, defaultBranch: "trunk" },
+  ];
   const { api: github } = fakeGitHubApi({
-    repos: [
-      { fullName: "acme/design", private: false, defaultBranch: "trunk" },
-      { fullName: "acme/components", private: false, defaultBranch: "trunk" },
-      { fullName: "acme/toolkit", private: false, defaultBranch: "trunk" },
-    ],
+    repos,
     manifests: {
       "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
       "acme/components": JSON.stringify({
@@ -372,7 +440,11 @@ test("POST /api/prs commits a manifest with the bumped version and every depBump
   });
   const { api: pr, putFileContents } = fakePrApi();
   const { factory } = factoryFor(makeApis({ github, pr }));
-  const deps = baseDeps({ apisFor: factory });
+  // The user's own accessible repos must also include acme/toolkit — this
+  // test isn't exercising Critical-C's confused-deputy gap, so keep the two
+  // lists in sync (see the dedicated confused-deputy tests below for what
+  // happens when they deliberately differ).
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ repos }).fetchFn });
 
   const entries = [
     entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" }),
@@ -578,24 +650,53 @@ test("POST /api/merge rejects a malformed body", async () => {
 // as "this specific PR's merge was rejected", must never see that status for
 // a failure that has nothing to do with the named PR at all). ------------------
 
-test("POST /api/merge reports 503, not 502, when the fresh membership check itself fails (a systemic failure, not this PR's)", async () => {
-  const brokenGithub: GitHubApi = {
-    listRepos: async () => {
-      throw new Error("installation token exchange failed: bad credentials");
-    },
-    getManifest: async () => null,
-  };
+test("POST /api/merge reports 503, not 502, when the fresh membership recheck itself fails (a systemic failure, not this PR's)", async () => {
   const { api: pr, calls: prCalls } = fakePrApi();
-  const { factory } = factoryFor(makeApis({ github: brokenGithub, pr }));
-  const deps = baseDeps({ apisFor: factory });
+  const { factory } = factoryFor(makeApis({ pr }));
+  const { fetchFn, calls: fetchCalls } = userScopedFetch({ membershipFailStatus: 500 });
+  const deps = baseDeps({ apisFor: factory, fetchFn });
 
   const res = await call("/api/merge", deps, session(), {
     method: "POST",
     body: JSON.stringify({ repo: "acme/design", pr: 55 }),
   });
   expect(res.status).toBe(503);
-  expect(await res.json()).toEqual({ error: "installation token exchange failed: bad credentials" });
-  // mergePr must never even be attempted once the membership check itself failed.
+  expect(await res.json()).toEqual({ error: MEMBERSHIP_VERIFICATION_FAILED });
+  // mergePr must never even be attempted once the membership recheck itself
+  // failed, and ownedRepos's own (user-scoped repos) call must never even be
+  // reached — the membership recheck runs first and short-circuits.
+  expect(prCalls).toEqual([]);
+  expect(fetchCalls.some((u) => u.includes("/repositories"))).toBe(false);
+});
+
+test("POST /api/merge reports 503, not 502, when ownedRepos itself fails for a reason other than a rejected token (a systemic failure, not this PR's)", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposFailStatus: 500 }).fetchFn });
+
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/design", pr: 55 }),
+  });
+  expect(res.status).toBe(503);
+  expect(prCalls).toEqual([]);
+});
+
+// Critical-C: a rejected user token (revoked/expired) must read as "sign in
+// again", not as a generic systemic failure — and never fall back to the
+// App's own installation-wide repo list just because this check failed.
+test("POST /api/merge reports 401 (sign in again), not 503, when the user's own token is rejected fetching their accessible repos", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposRejected: true }).fetchFn });
+
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/design", pr: 55 }),
+  });
+  expect(res.status).toBe(401);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).not.toContain(DEFAULT_USER_TOKEN);
   expect(prCalls).toEqual([]);
 });
 
@@ -753,6 +854,132 @@ test("POST /api/published with no session is a flat 401", async () => {
     body: JSON.stringify({ entries: [entry({ pkg: "@acme/design", repo: "acme/design" })] }),
   });
   expect(res.status).toBe(401);
+});
+
+// --- Critical C: confused deputy — authorization must follow the signed-in
+// user's own accessible repos, never the App installation's full reach -----
+//
+// The fixture below is the whole point: `acme/secret` sits in the App's own
+// installation-wide repo list (what `GET /installation/repositories` would
+// return, and what `fakeGitHubApi`/the graph-building path sees) but is
+// deliberately absent from the signed-in user's own accessible repos (what
+// `GET /user/installations/{id}/repositories`, i.e. `userScopedFetch`,
+// returns). A fixture where the two lists are identical would never
+// distinguish "authorized against the App's reach" from "authorized against
+// the user's own reach" — this one does.
+
+const SECRET_REPO: RepoRef = { fullName: "acme/secret", private: true, defaultBranch: "trunk" };
+
+function confusedDeputyFixture() {
+  // The App can reach acme/secret (e.g. some other, unrelated installation
+  // member added it) — this is deliberately part of the graph-building
+  // repo list, never the authorization list.
+  const { api: github } = fakeGitHubApi({
+    repos: [...DEFAULT_REPOS, SECRET_REPO],
+    manifests: {
+      "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        dependencies: { "@acme/design": "^1.0.0" },
+      }),
+      "acme/secret": JSON.stringify({ name: "@acme/secret", version: "9.0.0" }),
+    },
+  });
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ github, pr }));
+  // The signed-in user's own accessible repos deliberately exclude acme/secret.
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ repos: DEFAULT_REPOS }).fetchFn });
+  return { deps, prCalls };
+}
+
+test("POST /api/prs rejects a repo the App can reach but the signed-in user cannot, even though the installation's own repo list contains it", async () => {
+  const { deps, prCalls } = confusedDeputyFixture();
+  const entries = [entry({ pkg: "@acme/secret", repo: "acme/secret", toVersion: "9.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(403);
+  expect(prCalls).toEqual([]); // no branch/commit/PR ever attempted against acme/secret
+});
+
+test("POST /api/merge rejects a PR on a repo the App can reach but the signed-in user cannot", async () => {
+  const { deps, prCalls } = confusedDeputyFixture();
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/secret", pr: 1 }),
+  });
+  expect(res.status).toBe(403);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/train rejects a repo the App can reach but the signed-in user cannot, whether named in entries or in prs", async () => {
+  const { deps, prCalls } = confusedDeputyFixture();
+  const entries = [entry({ pkg: "@acme/secret", repo: "acme/secret" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/secret": 1 } }),
+  });
+  expect(res.status).toBe(403);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/published rejects a repo the App can reach but the signed-in user cannot", async () => {
+  const { deps } = confusedDeputyFixture();
+  let resolvableCalls = 0;
+  deps.isResolvable = async () => {
+    resolvableCalls++;
+    return true;
+  };
+  const entries = [entry({ pkg: "@acme/secret", repo: "acme/secret", toVersion: "9.0.1" })];
+  const res = await call("/api/published", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(403);
+  expect(resolvableCalls).toBe(0);
+});
+
+// The contrapositive of the four tests above, on the same fixture: a repo
+// that genuinely is in the user's own accessible list still works, proving
+// the 403s above are about acme/secret specifically and not some blanket
+// failure of the fixture itself.
+test("POST /api/merge still succeeds for a repo the signed-in user does own, on the very same confused-deputy fixture", async () => {
+  const { deps, prCalls } = confusedDeputyFixture();
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/design", pr: 7 }),
+  });
+  expect(res.status).toBe(200);
+  expect(prCalls).toEqual(["mergePr:acme/design:7"]);
+});
+
+// --- Important H: mutating routes re-verify installation membership, not --
+// just repo ownership — a removed collaborator must lose access before the
+// session cookie's own TTL runs out. -----------------------------------------
+
+test("POST /api/prs rejects with 403 when the user no longer belongs to the installation at all, even naming only owned-looking repos", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  // The user belongs to some other installation now, but not this session's.
+  const { fetchFn, calls: fetchCalls } = userScopedFetch({ memberOf: [999] });
+  const deps = baseDeps({ apisFor: factory, fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(403);
+  expect(prCalls).toEqual([]);
+  // The membership recheck must short-circuit before ownedRepos's own call.
+  expect(fetchCalls.some((u) => u.includes("/repositories"))).toBe(false);
+});
+
+test("POST /api/train rejects with 403 when the user no longer belongs to the installation at all", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ memberOf: [999] }).fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  expect(res.status).toBe(403);
+  expect(prCalls).toEqual([]);
 });
 
 // --- Fix-round: scopeFor/requiredChecksFor are looked up per installation ------

@@ -10,12 +10,31 @@
 // `session: SessionPayload | null` (never reads a cookie or a client-supplied
 // installation id itself) and is scoped to `session.installationId` alone. A
 // missing/invalid session is always a flat 401 — never a fall-through to a
-// default installation. A repo or PR named in a request body is only ever
-// acted on after confirming it belongs to `session.installationId`'s own
-// repository list, freshly re-checked on every mutating call — a client
-// cannot merge or open a PR against a repo it doesn't own by simply naming it.
+// default installation. A repo or PR named in a request body, on the
+// mutating routes (/api/prs, /api/merge, /api/train, /api/published), is
+// only ever acted on after confirming it belongs to the *signed-in user's*
+// own accessible repos within that installation — via `ownedRepos`, which
+// calls `GET /user/installations/{id}/repositories` with the user's own
+// OAuth token (decrypted from the session) — freshly re-checked on every
+// mutating call. This is deliberately never the App installation's own repo
+// list (`GET /installation/repositories`, fetched with the App's token):
+// GitHub grants the App access to a repo the instant *any* member of the
+// installation's account can see it, so gating on the App's reach would let
+// a read-only org member, or an outside collaborator on one unrelated repo,
+// open and merge PRs across every repo the App can reach — a confused
+// deputy. `/api/prs` and `/api/train` additionally re-verify the user still
+// belongs to the installation at all (`assertInstallationMembership`) before
+// touching anything, so a removed collaborator or a revoked installation
+// loses write access on their very next mutating call, not just at the end
+// of the session TTL.
 import type { SessionPayload } from "../auth/session";
 import { TokenStore, type AppCredentials } from "../auth/appAuth";
+import {
+  assertInstallationMembership,
+  listUserInstallationRepositories,
+  UserTokenRejectedError,
+  MEMBERSHIP_VERIFICATION_FAILED,
+} from "../auth/oauth";
 import { InstallationGitHubApi } from "../github/installationApi";
 import { InstallationPrApi, type PrApi } from "../github/prApi";
 import { InstallationRepoAdminApi } from "../prepare/installationAdminApi";
@@ -289,16 +308,50 @@ function parseTrainBody(raw: unknown): TrainRequestBody | null {
 // --- membership: never act on a repo the request names without checking ------
 
 /**
- * Fetches this installation's own repo list fresh and returns it as a
- * lookup — the one source of truth every mutating route below checks a
+ * Fetches *this signed-in user's* accessible repos within their installation
+ * — fresh, via `GET /user/installations/{id}/repositories` and the user's
+ * own OAuth token from `session.userToken` — and returns them as a lookup.
+ * This is the one source of truth every mutating route below checks a
  * client-supplied repo name against before acting on it. Mirrors
  * `assertInstallationMembership`'s "never trust the id/name alone, always
  * recheck against a fresh listing" shape, one layer down (repos within an
- * installation, rather than installations within a user).
+ * installation, rather than installations within a user) — and, like that
+ * function, deliberately never uses the App's own installation-wide token
+ * (see this module's doc comment for why that would be a confused deputy).
  */
-async function ownedRepos(apis: InstallationApis): Promise<Map<string, RepoRef>> {
-  const repos = await apis.githubApi.listRepos();
+async function ownedRepos(session: SessionPayload, fetchFn: typeof fetch): Promise<Map<string, RepoRef>> {
+  const repos = await listUserInstallationRepositories(session.userToken, session.installationId, fetchFn);
   return new Map(repos.map((r) => [r.fullName, r]));
+}
+
+/**
+ * Maps an `assertInstallationMembership` failure to a response: a
+ * verification failure (couldn't check at all) is retryable and reported at
+ * `retryableStatus`; a clean "no" is final and always a 403. Mirrors
+ * `membershipFailureStatus` in `src/server/index.ts` one layer down (a
+ * mutating API route rechecking membership mid-session, rather than login
+ * itself checking it once).
+ */
+function membershipErrorResponse(err: unknown, retryableStatus: number): Response {
+  const status = err instanceof Error && err.message === MEMBERSHIP_VERIFICATION_FAILED ? retryableStatus : 403;
+  return errorResponse(err, status);
+}
+
+/**
+ * Maps an `ownedRepos` failure to a response. `UserTokenRejectedError` is
+ * never a generic upstream failure: GitHub is saying the signed-in user's
+ * own token — the one embedded in their session cookie — no longer works
+ * (revoked, expired). That must read to the client as "you are effectively
+ * signed out, sign in again" (401), distinct from `otherStatus` (a
+ * transient/systemic failure worth retrying) — and it must never fall back
+ * to authorizing against some other, broader repo list just because this
+ * specific check failed.
+ */
+function ownedReposErrorResponse(err: unknown, otherStatus: number): Response {
+  if (err instanceof UserTokenRejectedError) {
+    return jsonResponse({ error: "session invalid — sign in again" }, 401);
+  }
+  return errorResponse(err, otherStatus);
 }
 
 // --- route handlers ------------------------------------------------------------
@@ -434,19 +487,32 @@ async function handlePrs(
   req: Request,
   apis: InstallationApis,
   deps: ApiDeps,
-  installationId: number,
+  session: SessionPayload,
 ): Promise<Response> {
+  const installationId = session.installationId;
   const raw = await readJsonBody(req);
   const entries = parseEntriesBody(raw);
   if (!entries) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[] } (non-empty)" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all
+  // before doing anything else — a removed collaborator or a revoked
+  // installation must lose write access on their very next call, not just
+  // once their session cookie's own TTL runs out.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    return membershipErrorResponse(err, 502);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
   // Never open a PR against a repo the client named that isn't actually part
@@ -514,29 +580,41 @@ async function handlePrs(
   return jsonResponse({ prs: results });
 }
 
-async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps): Promise<Response> {
+async function handleMerge(req: Request, apis: InstallationApis, deps: ApiDeps, session: SessionPayload): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseMergeBody(raw);
   if (!body) {
     return jsonResponse({ error: "expected { repo: string, pr: number }" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all —
+  // see handlePrs's identical check for why this can't wait for the session
+  // cookie to simply expire.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    // Deliberately 503, not 502 (mirroring the ownedRepos failure below): a
+    // systemic problem, not this PR's.
+    return membershipErrorResponse(err, 503);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    // Deliberately 503, not 502: this is `ownedRepos` (a fresh `listRepos`
-    // call) failing before this merge attempt ever reaches `mergePr` — a
-    // systemic problem (the installation token exchange is broken, GitHub
-    // itself is unreachable) that has nothing to do with *this* PR. A
-    // caller that reads any non-2xx here as "this PR's merge failed" (the
-    // hosted web client does exactly that, deliberately, for the ordinary
-    // case below) would badge a perfectly healthy PR "failed" because the
-    // installation's credentials went bad — a confident, wrong, per-item
-    // diagnosis of what is actually an account-wide outage. Giving the two
-    // failure modes distinct statuses is what lets a caller tell them apart
-    // without parsing the message.
-    return errorResponse(err, 503);
+    // Deliberately 503, not 502: this is `ownedRepos` failing before this
+    // merge attempt ever reaches `mergePr` — a systemic problem (the user's
+    // token is broken, GitHub itself is unreachable) that has nothing to do
+    // with *this* PR. A caller that reads any non-2xx here as "this PR's
+    // merge failed" (the hosted web client does exactly that, deliberately,
+    // for the ordinary case below) would badge a perfectly healthy PR
+    // "failed" because an unrelated credential went bad — a confident,
+    // wrong, per-item diagnosis of what is actually an account-wide outage.
+    // Giving the two failure modes distinct statuses is what lets a caller
+    // tell them apart without parsing the message.
+    return ownedReposErrorResponse(err, 503);
   }
 
   if (!owned.has(body.repo)) {
@@ -556,18 +634,30 @@ async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps)
   return jsonResponse({ merged: true, repo: body.repo, pr: body.pr });
 }
 
-async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps, session: SessionPayload): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseTrainBody(raw);
   if (!body) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[], prs: Record<string, number> }" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
+  // Re-verify the signed-in user still belongs to this installation at all —
+  // see handlePrs's identical check for why this can't wait for the session
+  // cookie to simply expire. The Auto Merge train can run unattended for a
+  // while; this is the one point where a mid-run revocation gets noticed.
+  try {
+    await assertInstallationMembership(session.userToken, session.installationId, fetchFn);
+  } catch (err) {
+    return membershipErrorResponse(err, 502);
+  }
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
   // Same membership check as /api/prs and /api/merge, applied to every repo
@@ -580,7 +670,6 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
     return jsonResponse({ error: `not part of this installation: ${foreign.join(", ")}` }, 403);
   }
 
-  const fetchFn = deps.fetchFn ?? fetch;
   const isResolvable = deps.isResolvable ?? defaultIsResolvable;
   const trainDeps: TrainDeps = {
     async mergePr(entry, pr) {
@@ -636,23 +725,32 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
  * (defaulting to a real npm registry lookup, overridden in every test so no
  * suite run ever makes a network call) — never the graph reload.
  */
-async function handlePublished(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+async function handlePublished(
+  req: Request,
+  apis: InstallationApis,
+  deps: ApiDeps,
+  session: SessionPayload,
+): Promise<Response> {
   const raw = await readJsonBody(req);
   const entries = parseEntriesBody(raw);
   if (!entries) {
     return jsonResponse({ error: "expected { entries: ChangesetEntry[] } (non-empty)" }, 400);
   }
 
+  const fetchFn = deps.fetchFn ?? fetch;
+
   let owned: Map<string, RepoRef>;
   try {
-    owned = await ownedRepos(apis);
+    owned = await ownedRepos(session, fetchFn);
   } catch (err) {
-    return errorResponse(err, 502);
+    return ownedReposErrorResponse(err, 502);
   }
 
-  // Same membership check as /api/prs, /api/merge and /api/train — a
+  // Same repo-ownership check as /api/prs, /api/merge and /api/train — a
   // tampered changeset body must not be able to make this route probe the
-  // registry on behalf of a repo outside this installation.
+  // registry on behalf of a repo outside this installation. (This route
+  // only reads a public registry, so unlike those three it does not also
+  // re-verify installation membership — see this module's doc comment.)
   const foreign = entries.filter((e) => !owned.has(e.repo));
   if (foreign.length > 0) {
     return jsonResponse(
@@ -661,7 +759,6 @@ async function handlePublished(req: Request, apis: InstallationApis, deps: ApiDe
     );
   }
 
-  const fetchFn = deps.fetchFn ?? fetch;
   const isResolvable = deps.isResolvable ?? defaultIsResolvable;
   const resolvable: string[] = [];
   for (const entry of entries) {
@@ -718,11 +815,11 @@ export async function handleApiRequest(
     return handleUpdate(req, apis, deps, session.installationId);
   }
   if (url.pathname === "/api/prs" && req.method === "POST") {
-    return handlePrs(req, apis, deps, session.installationId);
+    return handlePrs(req, apis, deps, session);
   }
-  if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps);
-  if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps);
-  if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps);
+  if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps, session);
+  if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps, session);
+  if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps, session);
 
   return jsonResponse({ error: "not found" }, 404);
 }
