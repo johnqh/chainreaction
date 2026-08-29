@@ -527,6 +527,69 @@ test("session secret never appears in a session cookie or the whoami response", 
 
 // --- Legacy token-gated UI keeps working -------------------------------------
 
+// --- Hosted API wiring: cookie -> session -> src/server/api.ts -------------
+
+test("a hosted API route 404s when no ApiDeps is configured (no GitHub App wired up)", async () => {
+  await withServer(makeDeps(), async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/api/repos`);
+    expect(res.status).toBe(404);
+  });
+});
+
+test("a hosted API route is scoped to the signed-in session's installation, end to end", async () => {
+  const { factory, calls } = (() => {
+    const seen: number[] = [];
+    return {
+      factory: (installationId: number) => {
+        seen.push(installationId);
+        return {
+          githubApi: { listRepos: async () => [], getManifest: async () => null },
+          adminApi: {
+            getRepo: async () => ({ defaultBranch: "main", isPrivate: false, allowAutoMerge: false }),
+            getProtection: async () => ({ status: 404 }),
+            hasFile: async () => true,
+            recentPrHeadSha: async () => null,
+            listCheckRuns: async () => [],
+            setProtection: async () => {},
+            enableAutoMerge: async () => {},
+          },
+          prApi: {
+            defaultBranchSha: async () => "sha",
+            createBranch: async () => {},
+            putFile: async () => {},
+            openPr: async () => 1,
+            mergePr: async () => {},
+            prState: async () => "OPEN",
+          },
+        };
+      },
+      calls: seen,
+    };
+  })();
+
+  const deps = makeDeps({
+    api: { apisFor: factory, scopeFor: () => "@acme/", requiredChecksFor: () => [] },
+  });
+
+  await withServer(deps, async (baseUrl) => {
+    const unauth = await fetch(`${baseUrl}/api/repos`);
+    expect(unauth.status).toBe(401);
+
+    const { state, stateCookie } = await login(baseUrl);
+    const callbackRes = await callback(baseUrl, state, stateCookie);
+    const sessionCookie = cookiesFrom(callbackRes).get("cr_session")!;
+
+    const res = await fetch(`${baseUrl}/api/repos`, { headers: { cookie: `cr_session=${sessionCookie}` } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ repos: [] });
+  });
+
+  // The default session installation in mockFetch() is 1 — this proves the
+  // hosted route was scoped to the real session, not left unauthenticated
+  // or defaulted to some other value.
+  expect(calls).toEqual([1]);
+});
+
 test("existing /api/token and /api/approve behavior is unaffected", async () => {
   let approved = false;
   await withServer(makeDeps({ onApprove: () => { approved = true; } }), async (baseUrl) => {
