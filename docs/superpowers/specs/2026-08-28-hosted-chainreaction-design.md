@@ -362,6 +362,28 @@ narrowing to halt-and-report.
 
 **Phase 3 — breadth.** Organisations, multiple installations, non-npm ecosystems.
 
+### Plan sequence
+
+Phase 1 turned out to be five plans, not three. The re-splits were forced by the work rather than
+chosen:
+
+| Plan | Scope | Status |
+|---|---|---|
+| A | Identity and graph — App auth, API-backed `GraphSource`, `planCascade` | merged |
+| B | Prepare and readiness — capability probe, Prepare, validation closure, the gate | merged |
+| C | Integration — concrete `RepoAdminApi`, package→repo mapping, required gate, CLI | written |
+| D | `ActionsValidator` — the workflow, the OIDC exchange, the runner package | not written |
+| E | Cascade execution, webhooks, DAG UI, MCP server, TrueForge | not written |
+
+**Plan C exists because Plan B's whole-branch review found that everything Plan B built had zero
+production callers.** Plan B produced a correct library and no product; its own Global Constraints
+forbade touching `planCascade`, which is where that contradiction came from. Plan C is the four
+conditions that review named — a concrete `RepoAdminApi`, the single package→repo mapping, the gate
+made a required argument rather than an available one, and an entry point that can be run.
+
+A gate nobody calls is not a gate, and neither validation nor execution should be built on top of
+one.
+
 `LocalWorkspaceValidator` (PR #3) is not throwaway: it stays the implementation used by the CLI and by
 tests, and `assertLinked` is shared verbatim with `ActionsValidator`.
 
