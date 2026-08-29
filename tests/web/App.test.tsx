@@ -20,8 +20,8 @@ function baseProps(overrides: Partial<AppProps> = {}): AppProps {
   return {
     nodes: nodes(),
     prepared: {},
-    onPlanUpdate: async () => [],
-    onPlanUpdateChain: async () => [],
+    onPlanUpdate: async () => ({ entries: [], skipped: [] }),
+    onPlanUpdateChain: async () => ({ entries: [], skipped: [] }),
     onOpenPrs: async () => new Map(),
     onMerge: async () => true,
     onAutoMerge: async () => ({ status: "success", merged: [] }),

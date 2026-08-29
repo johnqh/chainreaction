@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { ChangesetEntry } from "../graph/types";
 import type { PrState } from "../pr/lifecycle";
 import type { TrainOutcome } from "../pr/train";
+import type { SkippedRepo } from "./apiClient";
 import { describeWaiting, resolvePrState, waitingFor } from "./updatesModel";
 
 /** What a refresh pulls back from GitHub/the registry: no polling loop lives in this component. */
@@ -18,14 +19,17 @@ export interface UpdatesProps {
   /**
    * Plan an "Update": refresh `pkg`'s own direct dependencies to their
    * currently published versions. Must NOT open any PR — this only proposes
-   * the changeset for confirmation.
+   * the changeset for confirmation. `skipped` names repos whose manifest
+   * could not be parsed while planning — a repo silently missing from the
+   * graph is a repo silently missing from the cascade, so it must reach the
+   * proposal view, not just `entries`.
    */
-  onPlanUpdate: (pkg: string) => Promise<ChangesetEntry[]>;
+  onPlanUpdate: (pkg: string) => Promise<{ entries: ChangesetEntry[]; skipped: SkippedRepo[] }>;
   /**
    * Plan an "Update Chain": `pkg`'s full dependency closure, bumped bottom-up.
    * Must NOT open any PR — this only proposes the changeset for confirmation.
    */
-  onPlanUpdateChain: (pkg: string) => Promise<ChangesetEntry[]>;
+  onPlanUpdateChain: (pkg: string) => Promise<{ entries: ChangesetEntry[]; skipped: SkippedRepo[] }>;
   /** Open one PR per entry. Called only after the user confirms the proposed changeset. */
   onOpenPrs: (entries: ChangesetEntry[]) => Promise<Map<string, number>>;
   /** Merge one ready PR. Resolves `false` (does not throw) for an ordinary merge failure. */
@@ -43,7 +47,7 @@ const STATE_COLOR: Record<PrState, string> = {
   failed: "#c53030",
 };
 
-type Proposal = { kind: "update" | "chain"; entries: ChangesetEntry[] };
+type Proposal = { kind: "update" | "chain"; entries: ChangesetEntry[]; skipped: SkippedRepo[] };
 
 /**
  * The Update / Update Chain / PR-status / Merge / Auto Merge screen for the
@@ -102,8 +106,8 @@ export function Updates({
     setError(null);
     setPlanning(true);
     try {
-      const entries = kind === "update" ? await onPlanUpdate(selected!) : await onPlanUpdateChain(selected!);
-      setProposal({ kind, entries });
+      const result = kind === "update" ? await onPlanUpdate(selected!) : await onPlanUpdateChain(selected!);
+      setProposal({ kind, entries: result.entries, skipped: result.skipped });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -142,8 +146,14 @@ export function Updates({
     try {
       const ok = await onMerge(entry, pr);
       if (ok) {
+        // Merging only *starts* a publish (see the module doc on the
+        // product this is) — it is NOT evidence `entry.pkg` is resolvable.
+        // `published` may only ever be set from a real registry check
+        // (`onRefresh`'s result). Setting it here would let a downstream PR
+        // go `ready` before its dependency is actually installable — the
+        // exact merge/publish race this product exists to remove. See
+        // CRITICAL 1 in the final-review report.
         setObserved((o) => ({ ...o, [entry.repo]: "merged" }));
-        setPublished((p) => new Set(p).add(entry.pkg));
       } else {
         setObserved((o) => ({ ...o, [entry.repo]: "failed" }));
       }
@@ -188,7 +198,17 @@ export function Updates({
     try {
       const result = await onRefresh(openEntries, prs);
       setPublished(result.published);
-      setObserved(result.observed);
+      // Merge, never replace: `onRefresh` only ever reports "merged" (a
+      // stall's "failed" badge comes from onAutoMerge/onMerge observing it
+      // directly, not from a version comparison after the fact — see
+      // RefreshResult's doc comment). Replacing `observed` wholesale would
+      // erase a previously observed "failed" the instant a Refresh has
+      // nothing new to say about that repo. A later "merged" for the same
+      // repo DOES override an earlier "failed", deliberately — a merge that
+      // is later reported by a fresh graph read is newer, more authoritative
+      // information than a past failure. See IMPORTANT 4 in the
+      // final-review report.
+      setObserved((prev) => ({ ...prev, ...result.observed }));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -219,6 +239,12 @@ export function Updates({
             Proposed {proposal.kind === "update" ? "update" : "update chain"} —{" "}
             {proposal.entries.length} repo(s). Nothing has been opened yet.
           </p>
+          {proposal.skipped.length > 0 && (
+            <p data-testid="proposal-skipped">
+              {proposal.skipped.length} repo(s) could not be planned and are missing from this
+              proposal: {proposal.skipped.map((s) => `${s.repo} (${s.reason})`).join("; ")}
+            </p>
+          )}
           <table>
             <tbody>
               {proposal.entries.map((entry) => (

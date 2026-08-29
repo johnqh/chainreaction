@@ -50,13 +50,27 @@ export interface PrResult {
  * other kind of failure, and never need to inspect `message` to branch on
  * that distinction.
  */
+/** One PR that had already opened before a later entry in the same POST /api/prs call failed. */
+export interface OpenedPr {
+  repo: string;
+  pr: number;
+}
+
 export class ApiError extends Error {
   readonly status: number;
+  /**
+   * Set only for a partial POST /api/prs failure (see handlePrs in
+   * src/server/api.ts): the PRs that opened successfully before the entry
+   * that failed. A caller MUST surface these alongside `message` — they are
+   * real, already-open PRs on GitHub the user does not otherwise know about.
+   */
+  readonly opened?: OpenedPr[];
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, opened?: OpenedPr[]) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    if (opened !== undefined) this.opened = opened;
   }
 
   /** True for a 401 — the session is gone or invalid, distinct from every other failure. */
@@ -75,8 +89,13 @@ export interface ApiClientOptions {
 export interface ApiClient {
   getRepos(): Promise<RepoStatus[]>;
   getGraph(): Promise<GraphResult>;
-  /** Plans an Update (`mode: "one"`) or Update Chain (`mode: "chain"`). Opens no PR. */
-  postUpdate(pkg: string, mode: "one" | "chain"): Promise<ChangesetEntry[]>;
+  /**
+   * Plans an Update (`mode: "one"`) or Update Chain (`mode: "chain"`). Opens
+   * no PR. `skipped` names repos whose manifest could not be parsed while
+   * planning — a repo silently missing from the graph is a repo silently
+   * missing from the cascade, so this must reach the UI, not just `entries`.
+   */
+  postUpdate(pkg: string, mode: "one" | "chain"): Promise<{ entries: ChangesetEntry[]; skipped: SkippedRepo[] }>;
   /** Opens one PR per entry. Returns the PR number for each entry's repo. */
   postPrs(entries: ChangesetEntry[]): Promise<Map<string, number>>;
   /** Merges one PR. Throws on any failure — including an ordinary GitHub-side merge rejection. */
@@ -141,6 +160,11 @@ function isGraphEdge(v: unknown): v is GraphEdge {
 function isSkippedRepo(v: unknown): v is SkippedRepo {
   if (!isRecord(v)) return false;
   return typeof v["repo"] === "string" && typeof v["reason"] === "string";
+}
+
+function isOpenedPr(v: unknown): v is OpenedPr {
+  if (!isRecord(v)) return false;
+  return typeof v["repo"] === "string" && typeof v["pr"] === "number";
 }
 
 function isChangesetEntry(v: unknown): v is ChangesetEntry {
@@ -226,7 +250,14 @@ async function request(
   const body = await parseJsonBody(res);
   if (!res.ok) {
     const message = extractErrorMessage(body) ?? `${path} failed with status ${res.status}`;
-    throw new ApiError(res.status, message);
+    // Only handlePrs's partial-failure response carries `opened`, but this
+    // is checked generically — no other endpoint sends the field, so this
+    // never fires for them.
+    const opened =
+      isRecord(body) && Array.isArray(body["opened"]) && body["opened"].every(isOpenedPr)
+        ? (body["opened"] as OpenedPr[])
+        : undefined;
+    throw new ApiError(res.status, message, opened);
   }
   return body;
 }
@@ -283,10 +314,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       const parsed = validated(
         "POST /api/update",
         body,
-        (v): v is { entries: ChangesetEntry[] } =>
-          isRecord(v) && Array.isArray(v["entries"]) && v["entries"].every(isChangesetEntry),
+        (v): v is { entries: ChangesetEntry[]; skipped: SkippedRepo[] } =>
+          isRecord(v) &&
+          Array.isArray(v["entries"]) &&
+          v["entries"].every(isChangesetEntry) &&
+          Array.isArray(v["skipped"]) &&
+          v["skipped"].every(isSkippedRepo),
       );
-      return parsed.entries;
+      return { entries: parsed.entries, skipped: parsed.skipped };
     },
 
     async postPrs(entries) {

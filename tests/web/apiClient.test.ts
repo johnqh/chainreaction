@@ -141,14 +141,15 @@ function sampleEntry(): ChangesetEntry {
   };
 }
 
-test("postUpdate('one') POSTs exactly {pkg, mode: 'one'} and returns the entries", async () => {
-  const { fetchFn, calls } = fakeFetch(() => json({ entries: [sampleEntry()], skipped: [] }));
+test("postUpdate('one') POSTs exactly {pkg, mode: 'one'} and returns the entries and skipped repos", async () => {
+  const skipped = [{ repo: "acme/broken", reason: "manifest has no name field" }];
+  const { fetchFn, calls } = fakeFetch(() => json({ entries: [sampleEntry()], skipped }));
   const client = createApiClient({ fetchFn });
-  const entries = await client.postUpdate("@acme/app", "one");
+  const result = await client.postUpdate("@acme/app", "one");
   expect(calls).toEqual([
     { url: "/api/update", method: "POST", body: { pkg: "@acme/app", mode: "one" } },
   ]);
-  expect(entries).toEqual([sampleEntry()]);
+  expect(result).toEqual({ entries: [sampleEntry()], skipped });
 });
 
 test("postUpdate('chain') sends mode: 'chain'", async () => {
@@ -156,6 +157,17 @@ test("postUpdate('chain') sends mode: 'chain'", async () => {
   const client = createApiClient({ fetchFn });
   await client.postUpdate("@acme/app", "chain");
   expect(calls[0]!.body).toEqual({ pkg: "@acme/app", mode: "chain" });
+});
+
+test("postUpdate surfaces a non-empty skipped list verbatim, not just entries", async () => {
+  const skipped = [
+    { repo: "acme/broken", reason: "manifest has no name field" },
+    { repo: "acme/malformed", reason: "package.json is not valid JSON" },
+  ];
+  const { fetchFn } = fakeFetch(() => json({ entries: [], skipped }));
+  const client = createApiClient({ fetchFn });
+  const result = await client.postUpdate("@acme/app", "chain");
+  expect(result.skipped).toEqual(skipped);
 });
 
 test("postUpdate throws on 404 unknown package, carrying the server's message", async () => {
@@ -189,6 +201,36 @@ test("postPrs throws on a partial-failure 502, never returning a Map for what wa
   );
   const client = createApiClient({ fetchFn });
   await expect(client.postPrs([sampleEntry()])).rejects.toThrow("opening PR for acme/app failed: rate limited");
+});
+
+test("postPrs' thrown ApiError carries the exact `opened` PRs from a partial-failure 502 — not discarded", async () => {
+  const { fetchFn } = fakeFetch(() =>
+    json(
+      {
+        error: "opening PR for acme/app failed: rate limited",
+        opened: [
+          { repo: "acme/core", pr: 10 },
+          { repo: "acme/lib", pr: 11 },
+        ],
+      },
+      502,
+    ),
+  );
+  const client = createApiClient({ fetchFn });
+  const err = await client.postPrs([sampleEntry()]).catch((e) => e);
+  expect(err).toBeInstanceOf(ApiError);
+  expect((err as ApiError).opened).toEqual([
+    { repo: "acme/core", pr: 10 },
+    { repo: "acme/lib", pr: 11 },
+  ]);
+});
+
+test("a non-partial-failure ApiError (e.g. a 502 with no `opened` field) leaves `opened` undefined", async () => {
+  const { fetchFn } = fakeFetch(() => json({ error: "could not reach GitHub" }, 502));
+  const client = createApiClient({ fetchFn });
+  const err = await client.getGraph().catch((e) => e);
+  expect(err).toBeInstanceOf(ApiError);
+  expect((err as ApiError).opened).toBeUndefined();
 });
 
 test("postPrs rejects a malformed (but 2xx) response instead of casting it", async () => {

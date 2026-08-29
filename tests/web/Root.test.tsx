@@ -83,7 +83,7 @@ test("a failed initial load renders a readable error, never an empty repo list",
   expect(screen.queryByTestId("repo-count")).toBeNull();
 });
 
-test("a 401 from either initial call is reported as a signed-out session, not a generic error", async () => {
+test("a 401 from either initial call is reported as an unauthenticated state, not a generic error", async () => {
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => {
@@ -93,7 +93,40 @@ test("a 401 from either initial call is reported as a signed-out session, not a 
   render(<Root client={client} />);
 
   const error = await screen.findByTestId("root-error-message");
-  expect(error.textContent).toBe("You've been signed out — sign in again to continue.");
+  // Must not presume the visitor was ever signed in before — a first-time
+  // visitor also gets a 401 from `/api/repos`. See CRITICAL 2.
+  expect(error.textContent).not.toContain("signed out");
+  expect(error.textContent).toBe("Sign in with GitHub to see your repositories.");
+});
+
+// CRITICAL 2: sign-in is otherwise unreachable from the product — there is
+// no link, button, or redirect anywhere else in the app to GET /auth/login.
+test("a 401 renders an actual sign-in link to /auth/login, not just text", async () => {
+  const client = fakeClient({
+    getRepos: async () => {
+      throw new ApiError(401, "unauthorized");
+    },
+    getGraph: async () => sampleGraph(),
+  });
+  render(<Root client={client} />);
+
+  const link = await screen.findByTestId("sign-in-link");
+  expect(link.tagName).toBe("A");
+  expect(link.getAttribute("href")).toBe("/auth/login");
+  expect(link.textContent).toBe("Sign in with GitHub");
+});
+
+test("a generic (non-401) load error renders no sign-in link", async () => {
+  const client = fakeClient({
+    getRepos: async () => {
+      throw new ApiError(502, "installation token exchange failed: bad credentials");
+    },
+    getGraph: async () => sampleGraph(),
+  });
+  render(<Root client={client} />);
+
+  await screen.findByTestId("root-error");
+  expect(screen.queryByTestId("sign-in-link")).toBeNull();
 });
 
 function entryFor(pkg: string, repo: string): ChangesetEntry {
@@ -119,7 +152,7 @@ test("selecting a repo and clicking Update calls postUpdate('@acme/app', 'one') 
     getGraph: async () => sampleGraph(),
     postUpdate: async (pkg, mode) => {
       calls.push({ pkg, mode });
-      return [entry];
+      return { entries: [entry], skipped: [] };
     },
   });
   render(<Root client={client} />);
@@ -140,7 +173,7 @@ test("Update Chain calls postUpdate with mode 'chain', not 'one'", async () => {
     getGraph: async () => sampleGraph(),
     postUpdate: async (pkg, mode) => {
       calls.push({ pkg, mode });
-      return [entryFor(pkg, "acme/app")];
+      return { entries: [entryFor(pkg, "acme/app")], skipped: [] };
     },
   });
   render(<Root client={client} />);
@@ -159,7 +192,7 @@ test("a 502 from postMerge renders the PR as failed, not a thrown-error banner",
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => sampleGraph(),
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async () => new Map([[entry.repo, 42]]),
     postMerge: async (repo, pr) => {
       mergeCalls.push({ repo, pr });
@@ -191,7 +224,7 @@ test("a 403 from postMerge (repo not part of this installation) surfaces as a vi
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => sampleGraph(),
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async () => new Map([[entry.repo, 42]]),
     postMerge: async () => {
       throw new ApiError(403, "not part of this installation: acme/app");
@@ -224,7 +257,7 @@ test("a 503 from postMerge (a systemic failure) surfaces as a visible error, nev
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => sampleGraph(),
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async () => new Map([[entry.repo, 42]]),
     postMerge: async () => {
       throw new ApiError(503, "installation token exchange failed: bad credentials");
@@ -252,7 +285,7 @@ test("confirming a proposal calls postPrs with exactly the proposed entries — 
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => sampleGraph(),
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async (entries) => {
       prsCalls.push(entries);
       return new Map([[entry.repo, 42]]);
@@ -276,7 +309,7 @@ test("clicking Auto Merge calls postTrain with exactly the open entries and the 
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => sampleGraph(),
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async () => new Map([[entry.repo, 42]]),
     postTrain: async (entries, prs) => {
       trainCalls.push({ entries, prs });
@@ -315,7 +348,7 @@ test("Refresh marks a package published from postPublished, and merged (from the
       graphCallCount += 1;
       return graphCallCount === 1 ? sampleGraph() : bumpedGraph;
     },
-    postUpdate: async () => [entry],
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
     postPrs: async () => new Map([[entry.repo, 42]]),
     postPublished: async (entries) => {
       publishedCalls.push(entries);
@@ -368,7 +401,7 @@ test("CRITICAL: Refresh keeps a downstream PR blocked while its dependency has m
   const client = fakeClient({
     getRepos: async () => sampleRepos(),
     getGraph: async () => mergedGraph,
-    postUpdate: async () => [core, app],
+    postUpdate: async () => ({ entries: [core, app], skipped: [] }),
     postPrs: async () => new Map([[core.repo, 10], [app.repo, 11]]),
     postPublished: async () => {
       publishedCallCount += 1;
@@ -401,4 +434,86 @@ test("CRITICAL: Refresh keeps a downstream PR blocked while its dependency has m
   await screen.findByText("ready", { selector: `[data-testid="pr-state-${app.repo}"]` });
 
   expect(publishedCallCount).toBe(2);
+});
+
+// IMPORTANT 3: a repo GET /api/graph couldn't parse a manifest for is a repo
+// silently missing from the whole cascade if this never reaches a pixel.
+test("repos skipped while loading the graph are shown, not silently dropped", async () => {
+  const graphWithSkipped: GraphResult = {
+    ...sampleGraph(),
+    skipped: [{ repo: "acme/broken", reason: "manifest has no name field" }],
+  };
+  const client = fakeClient({
+    getRepos: async () => sampleRepos(),
+    getGraph: async () => graphWithSkipped,
+  });
+  render(<Root client={client} />);
+  await screen.findByTestId("repo-list");
+
+  const notice = await screen.findByTestId("root-skipped-message");
+  expect(notice.textContent).toBe(
+    "1 repo(s) could not be added to the dependency graph: acme/broken (manifest has no name field)",
+  );
+});
+
+test("no skipped notice is rendered when the graph load reports nothing skipped", async () => {
+  const client = fakeClient({
+    getRepos: async () => sampleRepos(),
+    getGraph: async () => sampleGraph(),
+  });
+  render(<Root client={client} />);
+  await screen.findByTestId("repo-list");
+
+  expect(screen.queryByTestId("root-skipped")).toBeNull();
+});
+
+// IMPORTANT 3 (second half): a partial POST /api/prs failure must never
+// throw away which PRs already opened on GitHub — the user is left with
+// real, open PRs they'd otherwise have no way to know about.
+test("a partial postPrs failure surfaces which PRs already opened, alongside the error", async () => {
+  const entry = entryFor("@acme/app", "acme/app");
+  const client = fakeClient({
+    getRepos: async () => sampleRepos(),
+    getGraph: async () => sampleGraph(),
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
+    postPrs: async () => {
+      throw new ApiError(502, "opening PR for acme/app failed: rate limited", [
+        { repo: "acme/core", pr: 10 },
+      ]);
+    },
+  });
+  render(<Root client={client} />);
+  await screen.findByTestId("repo-list");
+
+  fireEvent.click(screen.getByTestId("repo-item-@acme/app"));
+  fireEvent.click(screen.getByText("Update"));
+  await screen.findByTestId("updates-proposal");
+  fireEvent.click(screen.getByTestId("confirm-changeset"));
+
+  const error = await screen.findByTestId("updates-error");
+  expect(error.textContent).toBe(
+    "opening PR for acme/app failed: rate limited — PRs already opened before the failure: acme/core (PR #10)",
+  );
+});
+
+test("a postPrs failure with no already-opened PRs surfaces just the error, with no false 'already opened' claim", async () => {
+  const entry = entryFor("@acme/app", "acme/app");
+  const client = fakeClient({
+    getRepos: async () => sampleRepos(),
+    getGraph: async () => sampleGraph(),
+    postUpdate: async () => ({ entries: [entry], skipped: [] }),
+    postPrs: async () => {
+      throw new ApiError(502, "opening PR for acme/app failed: rate limited", []);
+    },
+  });
+  render(<Root client={client} />);
+  await screen.findByTestId("repo-list");
+
+  fireEvent.click(screen.getByTestId("repo-item-@acme/app"));
+  fireEvent.click(screen.getByText("Update"));
+  await screen.findByTestId("updates-proposal");
+  fireEvent.click(screen.getByTestId("confirm-changeset"));
+
+  const error = await screen.findByTestId("updates-error");
+  expect(error.textContent).toBe("opening PR for acme/app failed: rate limited");
 });
