@@ -7,6 +7,9 @@ import {
   assertInstallationMembership,
   OAuthStateStore,
   PendingLoginStore,
+  timingSafeEqualStrings,
+  MEMBERSHIP_VERIFICATION_FAILED,
+  MEMBERSHIP_NOT_A_MEMBER,
   type OAuthCredentials,
 } from "../../src/auth/oauth";
 
@@ -178,6 +181,55 @@ test("assertInstallationMembership always calls listUserInstallations rather tha
   }) as unknown as typeof fetch;
   await assertInstallationMembership("user-token", 7, fetchFn);
   expect(calls).toBe(1);
+});
+
+// A clean "no" (membership was checked and this id isn't in it) must not read
+// the same as "the check itself failed" — a caller mapping these to
+// different HTTP statuses (e.g. 403 vs 502) needs the messages to differ.
+test("assertInstallationMembership: a clean non-member rejection uses MEMBERSHIP_NOT_A_MEMBER, not the verification-failure message", async () => {
+  const fetchFn = (async () =>
+    new Response(JSON.stringify({ installations: [{ id: 1, account: { login: "acme" } }] }), {
+      status: 200,
+    })) as unknown as typeof fetch;
+  let message = "";
+  try {
+    await assertInstallationMembership("user-token", 999, fetchFn);
+  } catch (e) {
+    message = (e as Error).message;
+  }
+  expect(message).toBe(MEMBERSHIP_NOT_A_MEMBER);
+  expect(message).not.toBe(MEMBERSHIP_VERIFICATION_FAILED);
+});
+
+test("assertInstallationMembership: an underlying listUserInstallations failure surfaces as MEMBERSHIP_VERIFICATION_FAILED, without the underlying detail", async () => {
+  const fetchFn = (async () =>
+    new Response("token abc123-user-secret was rejected", { status: 500 })) as unknown as typeof fetch;
+  let message = "";
+  try {
+    await assertInstallationMembership("abc123-user-secret", 1, fetchFn);
+  } catch (e) {
+    message = (e as Error).message;
+  }
+  expect(message).toBe(MEMBERSHIP_VERIFICATION_FAILED);
+  expect(message).not.toBe(MEMBERSHIP_NOT_A_MEMBER);
+  expect(message).not.toContain("abc123-user-secret");
+  expect(message).not.toMatch(/500/);
+});
+
+test("timingSafeEqualStrings: identical strings compare equal", async () => {
+  expect(await timingSafeEqualStrings("same-value", "same-value")).toBe(true);
+});
+
+test("timingSafeEqualStrings: different strings of the same length compare unequal", async () => {
+  expect(await timingSafeEqualStrings("state-aaaa", "state-bbbb")).toBe(false);
+});
+
+test("timingSafeEqualStrings: different strings of different lengths compare unequal", async () => {
+  expect(await timingSafeEqualStrings("short", "a-much-longer-value")).toBe(false);
+});
+
+test("timingSafeEqualStrings: an empty string never matches a non-empty one", async () => {
+  expect(await timingSafeEqualStrings("", "non-empty")).toBe(false);
 });
 
 test("OAuthStateStore: a freshly issued state is accepted exactly once", () => {

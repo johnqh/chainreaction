@@ -85,6 +85,18 @@ test("readSession accepts a session right up to (but not past) expiry", async ()
   expect(await store.readSession(cookie)).not.toBeNull();
 });
 
+// The exact boundary: `exp === now()` must be treated as expired (the code
+// uses `exp <= now()`), not as "one more second of validity". Without this
+// case, a mutation that changed `<=` to `<` would leave the suite green —
+// the two tests on either side of the boundary don't touch this instant.
+test("readSession rejects a session at the exact instant it expires (exp === now)", async () => {
+  let clock = 1000;
+  const store = new SessionStore(SECRET, () => clock, 100);
+  const cookie = await store.createSession("user-1", 42);
+  clock += 100; // now() === exp exactly
+  expect(await store.readSession(cookie)).toBeNull();
+});
+
 test("constructing a SessionStore with an empty secret throws", () => {
   expect(() => new SessionStore("")).toThrow(/secret/);
 });

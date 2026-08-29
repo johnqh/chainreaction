@@ -113,20 +113,50 @@ export async function listUserInstallations(
 }
 
 /**
+ * Thrown by `assertInstallationMembership` when membership could not be
+ * checked at all (a network error, a non-2xx response, a malformed
+ * response body from GitHub) — as opposed to a clean answer of "no". A
+ * caller must not treat the two the same: the first is a transient failure
+ * worth retrying, the second is a fixed, unappealable "you don't belong to
+ * this installation". Neither message carries the underlying error's
+ * detail — that detail can include GitHub API status text derived from the
+ * request, and only this fixed string is ever safe to show a client.
+ */
+export const MEMBERSHIP_VERIFICATION_FAILED = "could not verify installation membership — try again";
+
+/** The fixed, safe message for "membership was checked successfully and the answer is no". */
+export const MEMBERSHIP_NOT_A_MEMBER = "installation is not accessible to this user";
+
+/**
  * Verifies that `installationId` is one the token's owner actually belongs
  * to, by re-fetching membership fresh rather than trusting the id itself.
  * This is the guard every installation-scoped route must call before
  * accepting a client-supplied installation id.
+ *
+ * Throws `MEMBERSHIP_VERIFICATION_FAILED` if membership could not be
+ * determined at all, and `MEMBERSHIP_NOT_A_MEMBER` if it was determined and
+ * the answer is no — callers should map the two to different responses
+ * (e.g. retryable vs. final) without ever surfacing anything more specific.
  */
 export async function assertInstallationMembership(
   userToken: string,
   installationId: number,
   fetchFn: typeof fetch = fetch,
 ): Promise<InstallationRef> {
-  const installations = await listUserInstallations(userToken, fetchFn);
+  let installations: InstallationRef[];
+  try {
+    installations = await listUserInstallations(userToken, fetchFn);
+  } catch {
+    // listUserInstallations' own message is safe (it never contains the
+    // token), but it's still not the right thing to hand a caller here: it
+    // describes *why the check failed*, not a membership decision, and a
+    // route several layers up should not have to know GitHub's HTTP status
+    // vocabulary to tell the two apart.
+    throw new Error(MEMBERSHIP_VERIFICATION_FAILED);
+  }
   const match = installations.find((i) => i.id === installationId);
   if (!match) {
-    throw new Error("installation is not accessible to this user");
+    throw new Error(MEMBERSHIP_NOT_A_MEMBER);
   }
   return match;
 }
@@ -152,17 +182,23 @@ export async function getAuthenticatedUser(
   return { id: body.id, login: body.login };
 }
 
-const STATE_TTL_SECONDS = 600;
+export const OAUTH_STATE_TTL_SECONDS = 600;
 
 /**
  * Issues and validates the OAuth `state` parameter. Each state is generated
  * per login attempt and is single-use: `consume` deletes it whether or not
  * it was valid, so a replayed callback (the same `state` used twice) is
- * rejected the second time even if the first use was legitimate. Without
- * this, the login flow is open to CSRF — an attacker could complete their
- * own OAuth flow and trick a victim's browser into loading the callback with
- * the attacker's `code`, binding the victim's session to the attacker's
- * GitHub account.
+ * rejected the second time even if the first use was legitimate.
+ *
+ * Single-use alone is not the whole CSRF guard, though: it stops a `state`
+ * from being replayed, but says nothing about *which browser* presents it.
+ * An attacker can start their own login, obtain a real, unconsumed `state`
+ * bound to their own GitHub account, and hand it to a victim's browser in a
+ * link — the store alone would accept that callback. The caller (see
+ * `src/server/index.ts`) closes that gap with a double-submit cookie: the
+ * same `state` is also set as an `HttpOnly` cookie at issue time, and the
+ * callback is only accepted when the query `state` matches *both* this
+ * store's record *and* the cookie the requesting browser presents.
  */
 export class OAuthStateStore {
   private issued = new Map<string, number>();
@@ -171,7 +207,7 @@ export class OAuthStateStore {
 
   issue(): string {
     const state = crypto.randomUUID();
-    this.issued.set(state, this.now() + STATE_TTL_SECONDS);
+    this.issued.set(state, this.now() + OAUTH_STATE_TTL_SECONDS);
     return state;
   }
 
@@ -181,6 +217,27 @@ export class OAuthStateStore {
     this.issued.delete(state);
     return expiry !== undefined && expiry > this.now();
   }
+}
+
+/**
+ * Constant-time string equality, for comparing two values neither of which
+ * should leak how many leading characters an attacker's guess got right —
+ * here, the query `state` against the double-submit cookie's value. Hashing
+ * both to a fixed-length digest first means the comparison never leaks the
+ * inputs' original lengths either. Uses `crypto.subtle.digest`, the same
+ * Web Crypto surface `SessionStore` signs and verifies with.
+ */
+export async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const va = new Uint8Array(da);
+  const vb = new Uint8Array(db);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i]! ^ vb[i]!;
+  return diff === 0;
 }
 
 const PENDING_LOGIN_TTL_SECONDS = 300;

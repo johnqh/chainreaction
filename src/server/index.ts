@@ -9,6 +9,9 @@ import {
   assertInstallationMembership,
   OAuthStateStore,
   PendingLoginStore,
+  OAUTH_STATE_TTL_SECONDS,
+  timingSafeEqualStrings,
+  MEMBERSHIP_VERIFICATION_FAILED,
 } from "../auth/oauth";
 import { SessionStore, DEFAULT_SESSION_TTL_SECONDS } from "../auth/session";
 
@@ -34,6 +37,12 @@ const TOKEN_HEADER = "x-chainreaction-token";
 const SESSION_COOKIE = "cr_session";
 const PENDING_COOKIE = "cr_pending";
 const PENDING_COOKIE_MAX_AGE_SECONDS = 300;
+const STATE_COOKIE = "cr_oauth_state";
+
+/** Maps an `assertInstallationMembership` failure to a status: a verification failure is retryable, a clean "no" is final. */
+function membershipFailureStatus(err: unknown): number {
+  return err instanceof Error && err.message === MEMBERSHIP_VERIFICATION_FAILED ? 502 : 403;
+}
 
 function randomToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
@@ -99,9 +108,9 @@ export function createServer(deps: ServerDeps, port = 3737) {
   // ../auth/oauth already scrub secrets from their own thrown messages, but
   // this is the backstop for anything else (e.g. a network-level exception)
   // that might not be.
-  function loginFailure(err: unknown, status = 502): Response {
+  function loginFailure(err: unknown, status = 502, setCookie?: string): Response {
     const message = err instanceof Error ? err.message : "login failed";
-    return new Response(message, { status });
+    return new Response(message, { status, headers: setCookie ? { "set-cookie": setCookie } : undefined });
   }
 
   return Bun.serve({
@@ -116,25 +125,54 @@ export function createServer(deps: ServerDeps, port = 3737) {
 
       if (url.pathname === "/auth/login" && req.method === "GET") {
         const state = states.issue();
-        return new Response(null, {
-          status: 302,
-          headers: { location: authorizeUrl(deps.auth.clientId, deps.auth.callbackUrl, state) },
+        const headers = new Headers({
+          location: authorizeUrl(deps.auth.clientId, deps.auth.callbackUrl, state),
         });
+        // Double-submit cookie: `state` alone being single-use only stops a
+        // *replay* of the same callback. It does nothing to stop an attacker
+        // completing their own login, obtaining a real unconsumed `state`
+        // for *their own* GitHub account, and inducing the victim's browser
+        // to hit the callback with it — the victim would end up signed into
+        // the attacker's account. Binding `state` to this cookie means the
+        // callback only succeeds in the same browser that started the flow.
+        headers.append(
+          "set-cookie",
+          serializeCookie(STATE_COOKIE, state, {
+            secure: secureCookies,
+            maxAgeSeconds: OAUTH_STATE_TTL_SECONDS,
+          }),
+        );
+        return new Response(null, { status: 302, headers });
       }
 
       if (url.pathname === callbackPath && req.method === "GET") {
         const code = url.searchParams.get("code");
         const state = url.searchParams.get("state");
+        const stateCookie = cookies[STATE_COOKIE];
+        // The state cookie is single-use exactly like the state itself: it is
+        // cleared here so it always leaves with this response, whether the
+        // login below succeeds or fails.
+        const clearStateCookie = serializeCookie(STATE_COOKIE, "", { secure: secureCookies, clear: true });
+
         if (!code || !state) {
-          return new Response("missing code or state", { status: 400 });
-        }
-        // Single-use and compared server-side: a callback whose state does not
-        // match anything issued (wrong, forged, or already consumed once
-        // before) is rejected outright. This is the CSRF guard.
-        if (!states.consume(state)) {
-          return new Response("invalid or expired state", { status: 400 });
+          return new Response("missing code or state", { status: 400, headers: { "set-cookie": clearStateCookie } });
         }
 
+        // Single-use, checked server-side (stops replay of the same
+        // callback) AND bound to the cookie set at /auth/login (stops an
+        // attacker's own valid, unconsumed state+code pair from being handed
+        // to a victim's browser — see OAuthStateStore's doc comment). Both
+        // checks run unconditionally so the state is always consumed exactly
+        // once per callback, regardless of which one fails.
+        const stateWasIssued = states.consume(state);
+        const stateBoundToThisBrowser =
+          stateCookie !== undefined && stateCookie.length > 0 && (await timingSafeEqualStrings(stateCookie, state));
+        if (!stateWasIssued || !stateBoundToThisBrowser) {
+          return new Response("invalid or expired state", { status: 400, headers: { "set-cookie": clearStateCookie } });
+        }
+
+        // From here on, the state cookie has done its job (verified above)
+        // and every exit from this handler clears it — success or failure.
         let accessToken: string;
         try {
           ({ accessToken } = await exchangeCode(
@@ -143,21 +181,21 @@ export function createServer(deps: ServerDeps, port = 3737) {
             fetchFn,
           ));
         } catch (err) {
-          return loginFailure(err);
+          return loginFailure(err, 502, clearStateCookie);
         }
 
         let user: { id: number; login: string };
         try {
           user = await getAuthenticatedUser(accessToken, fetchFn);
         } catch (err) {
-          return loginFailure(err);
+          return loginFailure(err, 502, clearStateCookie);
         }
 
         const installationIdParam = url.searchParams.get("installation_id");
         if (installationIdParam !== null) {
           const requested = Number(installationIdParam);
           if (!Number.isInteger(requested)) {
-            return new Response("invalid installation_id", { status: 400 });
+            return new Response("invalid installation_id", { status: 400, headers: { "set-cookie": clearStateCookie } });
           }
           // GitHub can hand us this id directly (e.g. it was attached during
           // an "Install & Authorize" flow), but it arrives the same way any
@@ -166,45 +204,46 @@ export function createServer(deps: ServerDeps, port = 3737) {
           let membership: { id: number };
           try {
             membership = await assertInstallationMembership(accessToken, requested, fetchFn);
-          } catch {
-            return new Response("installation is not accessible to this user", { status: 403 });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : MEMBERSHIP_VERIFICATION_FAILED;
+            return new Response(message, {
+              status: membershipFailureStatus(err),
+              headers: { "set-cookie": clearStateCookie },
+            });
           }
           const cookie = await sessions.createSession(String(user.id), membership.id);
-          return new Response(null, {
-            status: 302,
-            headers: {
-              location: "/",
-              "set-cookie": serializeCookie(SESSION_COOKIE, cookie, {
-                secure: secureCookies,
-                maxAgeSeconds: DEFAULT_SESSION_TTL_SECONDS,
-              }),
-            },
-          });
+          const headers = new Headers({ location: "/" });
+          headers.append(
+            "set-cookie",
+            serializeCookie(SESSION_COOKIE, cookie, { secure: secureCookies, maxAgeSeconds: DEFAULT_SESSION_TTL_SECONDS }),
+          );
+          headers.append("set-cookie", clearStateCookie);
+          return new Response(null, { status: 302, headers });
         }
 
         let installations;
         try {
           installations = await listUserInstallations(accessToken, fetchFn);
         } catch (err) {
-          return loginFailure(err);
+          return loginFailure(err, 502, clearStateCookie);
         }
 
         if (installations.length === 0) {
-          return new Response("this GitHub account has no accessible installations", { status: 403 });
+          return new Response("this GitHub account has no accessible installations", {
+            status: 403,
+            headers: { "set-cookie": clearStateCookie },
+          });
         }
 
         if (installations.length === 1) {
           const cookie = await sessions.createSession(String(user.id), installations[0]!.id);
-          return new Response(null, {
-            status: 302,
-            headers: {
-              location: "/",
-              "set-cookie": serializeCookie(SESSION_COOKIE, cookie, {
-                secure: secureCookies,
-                maxAgeSeconds: DEFAULT_SESSION_TTL_SECONDS,
-              }),
-            },
-          });
+          const headers = new Headers({ location: "/" });
+          headers.append(
+            "set-cookie",
+            serializeCookie(SESSION_COOKIE, cookie, { secure: secureCookies, maxAgeSeconds: DEFAULT_SESSION_TTL_SECONDS }),
+          );
+          headers.append("set-cookie", clearStateCookie);
+          return new Response(null, { status: 302, headers });
         }
 
         // Multiple installations and no hint from GitHub about which one:
@@ -215,18 +254,15 @@ export function createServer(deps: ServerDeps, port = 3737) {
         const options = installations
           .map((i) => `<li><a href="/auth/choose?installationId=${i.id}">${escapeHtml(i.account)}</a></li>`)
           .join("");
+        const pickerHeaders = new Headers({ "content-type": "text/html" });
+        pickerHeaders.append(
+          "set-cookie",
+          serializeCookie(PENDING_COOKIE, pendingId, { secure: secureCookies, maxAgeSeconds: PENDING_COOKIE_MAX_AGE_SECONDS }),
+        );
+        pickerHeaders.append("set-cookie", clearStateCookie);
         return new Response(
           `<!doctype html><html><body><h1>Choose an installation</h1><ul>${options}</ul></body></html>`,
-          {
-            status: 200,
-            headers: {
-              "content-type": "text/html",
-              "set-cookie": serializeCookie(PENDING_COOKIE, pendingId, {
-                secure: secureCookies,
-                maxAgeSeconds: PENDING_COOKIE_MAX_AGE_SECONDS,
-              }),
-            },
-          },
+          { status: 200, headers: pickerHeaders },
         );
       }
 
@@ -244,8 +280,9 @@ export function createServer(deps: ServerDeps, port = 3737) {
         let membership: { id: number };
         try {
           membership = await assertInstallationMembership(login.userToken, requested, fetchFn);
-        } catch {
-          return new Response("installation is not accessible to this user", { status: 403 });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : MEMBERSHIP_VERIFICATION_FAILED;
+          return new Response(message, { status: membershipFailureStatus(err) });
         }
         const cookie = await sessions.createSession(login.userId, membership.id);
         const headers = new Headers({ location: "/" });
