@@ -70,6 +70,183 @@ test("hasFile is true on 200, false on 404, and throws on anything else", async 
   await expect(mk(500).hasFile("acme/lib", "a.yml")).rejects.toThrow(/500/);
 });
 
+test("recentPrHeadSha returns the head sha of the most recently updated PR", async () => {
+  const { fn, calls } = stub(() => new Response(JSON.stringify([
+    { number: 7, head: { sha: "abc123" } },
+  ])));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.recentPrHeadSha("acme/lib")).toBe("abc123");
+  expect(calls[0]!.url).toContain("state=all");
+  expect(calls[0]!.url).toContain("sort=updated");
+  expect(calls[0]!.url).toContain("direction=desc");
+  expect(calls[0]!.url).toContain("per_page=1");
+});
+
+test("recentPrHeadSha returns null for a repo that has never had a pull request", async () => {
+  const { fn } = stub(() => new Response(JSON.stringify([])));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.recentPrHeadSha("acme/lib")).toBeNull();
+});
+
+test("recentPrHeadSha finds a merged/closed PR too — state=all, not just open", async () => {
+  const { fn } = stub(() => new Response(JSON.stringify([
+    { number: 3, state: "closed", merged_at: "2026-01-01T00:00:00Z", head: { sha: "closed-sha" } },
+  ])));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.recentPrHeadSha("acme/lib")).toBe("closed-sha");
+});
+
+test("recentPrHeadSha rejects a response that is not an array", async () => {
+  const { fn } = stub(() => new Response(JSON.stringify({ message: "not found" })));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.recentPrHeadSha("acme/lib")).rejects.toThrow(/not an array/);
+});
+
+test("recentPrHeadSha rejects a PR entry with no usable head.sha", async () => {
+  const { fn } = stub(() => new Response(JSON.stringify([{ number: 1, head: {} }])));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.recentPrHeadSha("acme/lib")).rejects.toThrow(/head\.sha/);
+});
+
+test("recentPrHeadSha throws on a non-ok response instead of reporting no PRs", async () => {
+  const { fn } = stub(() => new Response("{}", { status: 500 }));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.recentPrHeadSha("acme/lib")).rejects.toThrow(/500/);
+});
+
+/**
+ * `listCheckRuns` hits two endpoints per call: paginated check-runs, then
+ * one combined-status request. `noStatuses` builds a handler that answers
+ * the check-runs pages from `checkRuns` and the status endpoint with an
+ * empty `statuses: []` by default, so tests only about the Checks API don't
+ * have to know the Statuses API request exists at all.
+ */
+function checkRunsStub(opts: {
+  checkRunsPages: (call: { url: string }) => Response;
+  statuses?: Array<{ context: string }> | (() => Response);
+}) {
+  return stub((url) => {
+    if (url.includes("/status")) {
+      return typeof opts.statuses === "function"
+        ? opts.statuses()
+        : new Response(JSON.stringify({ statuses: opts.statuses ?? [] }));
+    }
+    return opts.checkRunsPages({ url });
+  });
+}
+
+test("listCheckRuns returns the distinct check-run names observed on a ref", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({
+      total_count: 2,
+      check_runs: [{ id: 1, name: "build" }, { id: 2, name: "test" }],
+    })),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.listCheckRuns("acme/lib", "main")).toEqual(["build", "test"]);
+});
+
+test("listCheckRuns deduplicates repeated names — a re-run reports the same name twice", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({
+      total_count: 2,
+      check_runs: [{ id: 1, name: "build" }, { id: 2, name: "build" }],
+    })),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.listCheckRuns("acme/lib", "main")).toEqual(["build"]);
+});
+
+test("listCheckRuns follows the Link header across pages, not just total_count", async () => {
+  const nextUrl = "https://api.github.com/repos/acme/lib/commits/main/check-runs?per_page=100&page=2";
+  const { fn, calls } = checkRunsStub({
+    checkRunsPages: ({ url }) => {
+      if (url.includes("page=2")) {
+        return new Response(JSON.stringify({ total_count: 2, check_runs: [{ id: 2, name: "test" }] }));
+      }
+      return new Response(
+        JSON.stringify({ total_count: 2, check_runs: [{ id: 1, name: "build" }] }),
+        { headers: { link: `<${nextUrl}>; rel="next"` } },
+      );
+    },
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.listCheckRuns("acme/lib", "main")).toEqual(["build", "test"]);
+  expect(calls.some((c) => c.url.includes("page=2"))).toBe(true);
+});
+
+test("listCheckRuns rejects a response with no check_runs array", async () => {
+  const { fn } = checkRunsStub({ checkRunsPages: () => new Response(JSON.stringify({ total_count: 0 })) });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/check_runs/);
+});
+
+test("listCheckRuns rejects a check-run with no usable name rather than silently dropping it", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 1, check_runs: [{ id: 1 }] })),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/no usable name/);
+});
+
+test("listCheckRuns throws on a non-ok check-runs response instead of reporting no checks", async () => {
+  const { fn } = stub(() => new Response("{}", { status: 500 }));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  // A 500 quietly becoming "no checks observed" would misreport a real
+  // required check as never-observed and block a perfectly good repo.
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/500/);
+});
+
+// --- FIX: required-check contexts also come from the legacy Statuses API
+// (CircleCI, Buildkite, Jenkins, Travis and others report through it, never
+// through check-runs). Skipping it would make Prepare reject every one of
+// those repos' genuine required-check names as "never observed". ---
+
+test("listCheckRuns includes legacy status contexts, not only check-run names", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 0, check_runs: [] })),
+    statuses: [{ context: "ci/circleci: build" }],
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.listCheckRuns("acme/lib", "main")).toEqual(["ci/circleci: build"]);
+});
+
+test("listCheckRuns unions and dedupes check-run names with legacy status contexts", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: "build" }] })),
+    statuses: [{ context: "build" }, { context: "ci/circleci: test" }],
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  expect(await api.listCheckRuns("acme/lib", "main")).toEqual(["build", "ci/circleci: test"]);
+});
+
+test("listCheckRuns rejects a response with no statuses array", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 0, check_runs: [] })),
+    statuses: () => new Response(JSON.stringify({})),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/statuses/);
+});
+
+test("listCheckRuns rejects a status with no usable context rather than silently dropping it", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 0, check_runs: [] })),
+    statuses: () => new Response(JSON.stringify({ statuses: [{ state: "success" }] })),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/no usable context/);
+});
+
+test("listCheckRuns throws on a non-ok status response instead of reporting no checks", async () => {
+  const { fn } = checkRunsStub({
+    checkRunsPages: () => new Response(JSON.stringify({ total_count: 0, check_runs: [] })),
+    statuses: () => new Response("{}", { status: 500 }),
+  });
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await expect(api.listCheckRuns("acme/lib", "main")).rejects.toThrow(/500/);
+});
+
 test("setProtection sends required status checks and no review requirement", async () => {
   const { fn, calls } = stub(() => new Response("{}", { status: 200 }));
   await new InstallationRepoAdminApi(token, 1, fn).setProtection("acme/lib", "main", ["ci"]);
@@ -116,11 +293,13 @@ test("no token reaches an error message from any throwing method", async () => {
     );
 
   // Every method in this class that can throw, exercised with a status that
-  // makes it throw. Adding a sixth throwing method without extending this
+  // makes it throw. Adding another throwing method without extending this
   // list should be the obvious next step, not a silent gap.
   const attempts: Array<() => Promise<unknown>> = [
     () => mkApi(500).getRepo("acme/lib"),
     () => mkApi(500).hasFile("acme/lib", "a.yml"),
+    () => mkApi(500).recentPrHeadSha("acme/lib"),
+    () => mkApi(500).listCheckRuns("acme/lib", "main"),
     () => mkApi(500).setProtection("acme/lib", "main", ["ci"]),
     () => mkApi(500).enableAutoMerge("acme/lib"),
   ];

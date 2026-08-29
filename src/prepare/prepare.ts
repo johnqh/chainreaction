@@ -37,6 +37,26 @@ async function assess(
         `with no CI cannot take part in a cascade.`,
     );
   }
+  // A required status check that has never been observed on the commit
+  // branch protection actually evaluates (a PR head, sampled via
+  // caps.observedChecksRef — see probeRepo) will never be satisfied. Setting
+  // one as required anyway does not fail loudly: it succeeds, then branch
+  // protection waits forever on a check that never arrives, and every pull
+  // request to the repo — the customer's own as much as ChainReaction's —
+  // becomes silently unmergeable. This is the one blocker in this function
+  // that exists purely to fail loudly here instead of failing silently later.
+  const neverObserved = requiredChecks.filter((c) => !caps.observedChecks.includes(c));
+  if (neverObserved.length > 0) {
+    blockers.push(
+      `${full} has never reported a check named ${neverObserved.map((c) => JSON.stringify(c)).join(", ")} ` +
+        `on the commit inspected (${caps.observedChecksRef}, its most recent pull request head — or the ` +
+        `default branch tip if it has never had one). ` +
+        (caps.observedChecks.length > 0
+          ? `Checks observed there: ${caps.observedChecks.join(", ")}. `
+          : `No checks have been observed on that commit at all. `) +
+        `Set CR_REQUIRED_CHECKS to the name this repo's own CI actually reports on pull requests, then prepare again.`,
+    );
+  }
   if (caps.protection === "protected") {
     // setProtection is a whole-object PUT replace: sending only requiredChecks
     // would silently strip whatever the customer already configured (required

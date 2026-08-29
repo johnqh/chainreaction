@@ -1,0 +1,90 @@
+# Add this file to your repository at:
+#
+#   .github/workflows/chainreaction-validate.yml
+#
+# ChainReaction dispatches this workflow to validate a cascade before it
+# merges. It holds NO secret: it exchanges a GitHub-issued OIDC token for a
+# short-lived, cascade-scoped token at the control plane, then hands off to
+# the published validator package, which does the real checkout/build/test
+# work. See the "Adding the validation workflow" section of this project's
+# README for what to configure and why ChainReaction cannot add this file
+# for you.
+#
+# This file's PATH — .github/workflows/chainreaction-validate.yml — is what
+# Prepare verifies exists on your default branch. That path must not change.
+#
+# The job name below (chainreaction-validate) is cosmetic — a human-readable
+# label in the Actions log, nothing more. It is NOT a required status check:
+# this workflow only runs via workflow_dispatch, and a required check is
+# evaluated against a pull request's head commit, which a dispatched run
+# never attaches to. Your required check is your own CI's existing one
+# (e.g. "build", "test", "ci"), set via CR_REQUIRED_CHECKS. Rename this job
+# freely; nothing here depends on its name.
+name: ChainReaction Validate
+
+on:
+  workflow_dispatch:
+    inputs:
+      cascade_id:
+        description: The cascade this run validates.
+        required: true
+        type: string
+
+# No other permission is requested. This workflow never pushes, never opens
+# a PR, and never touches repository contents beyond reading them.
+permissions:
+  id-token: write # request the OIDC token exchanged below
+  contents: read
+
+env:
+  # Override any of these with a repository or organization Actions variable
+  # of the same name if you point this workflow at a different deployment.
+  CR_URL: ${{ vars.CHAINREACTION_URL || 'https://chainreaction.dev' }}
+  CR_AUDIENCE: ${{ vars.CHAINREACTION_AUDIENCE || 'chainreaction' }}
+  CR_VALIDATE_PACKAGE: ${{ vars.CHAINREACTION_VALIDATE_PACKAGE || '@chainreaction/validate' }}
+
+jobs:
+  chainreaction-validate:
+    name: chainreaction-validate
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit, not the mutable `v2` tag — this runs before the
+      # claim below, in a job that goes on to hold a cascade-scoped token.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # Exchanges this run's OIDC token at the control plane for a scoped,
+      # short-lived token plus the changeset. The response is written
+      # straight to a file, never echoed or captured as a step output, and
+      # the token is masked the instant it's read back, before anything
+      # downstream can print it.
+      #
+      # `cascade_id` travels through `env`, never spliced into `run:` text:
+      # `${{ }}` is substituted before bash ever sees this script, so
+      # interpolating it directly would let a crafted `cascade_id` execute
+      # as code in a job holding `id-token: write` and, moments later, a
+      # cascade-scoped token — never do that here or in any step added to
+      # this file. `jq -nc` then builds the JSON body with correct escaping.
+      - name: Claim this cascade
+        env:
+          CASCADE_ID: ${{ inputs.cascade_id }}
+        run: |
+          set -euo pipefail
+          oidc=$(curl -sS -H "authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$CR_AUDIENCE" | jq -r .value)
+          curl -sS --fail-with-body -X POST "$CR_URL/api/ci/claim" \
+            -H "authorization: Bearer $oidc" \
+            -H "content-type: application/json" \
+            -d "$(jq -nc --arg id "$CASCADE_ID" '{cascade_id:$id}')" \
+            -o "$RUNNER_TEMP/chainreaction-claim.json"
+          # `// empty` turns a missing/null `.token` into "", not the string
+          # "null" — masking "null" would redact that word everywhere else
+          # in the log, stack traces and JSON dumps included.
+          token=$(jq -r '.token // empty' "$RUNNER_TEMP/chainreaction-claim.json")
+          [ -n "$token" ] || { echo "claim returned no token"; exit 1; }
+          echo "::add-mask::$token"
+
+      # The claim file — still only on disk, never in a log or a step output
+      # — carries both the token and the changeset. The validator package
+      # reads it directly, so the token never has to cross a step boundary.
+      - name: Assemble the workspace and validate
+        run: bunx "$CR_VALIDATE_PACKAGE" "$RUNNER_TEMP/chainreaction-claim.json"
