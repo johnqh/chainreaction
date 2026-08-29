@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { ChangesetEntry } from "../graph/types";
 import type { ValidationRequest, ValidationOutcome } from "./types";
-import { buildWorkspaceRoot, applyEntry, assertLinked, type Runner, type ValidationResult } from "../sandbox/workspace";
+import { buildWorkspaceRoot, applyEntry, assertLinked, memberDir, type Runner, type ValidationResult } from "../sandbox/workspace";
 
 /**
  * Clones one repo at its default branch into `dest`, authenticated with the
@@ -41,20 +41,25 @@ export interface RunnerIo {
 }
 
 /**
- * Matches the directory scheme `src/sandbox/workspace.ts` uses internally
- * (`memberDir`, not exported) so paths this file constructs line up with the
- * ones `buildWorkspaceRoot` and `assertLinked` compute for the same repo.
- */
-const memberDirFor = (repo: string): string => `repos/${repo.split("/")[1]}`;
-
-/**
- * Strips the scoped token out of arbitrary text before it can end up in a
- * `ValidationResult.output` or a thrown error. `run` executes the
- * customer's own build and test commands — their output is arbitrary and
- * not under this file's control, and a verbose failure (a stack trace that
- * dumps `process.env`, a tool that echoes the command it ran) could echo the
- * token even though `runValidation` itself never constructs a string
- * containing it. This is the last line of defence, not the only one.
+ * Strips an exact, contiguous, literal occurrence of the token out of an
+ * already-assembled string, so it does not end up in a `ValidationResult.output`
+ * or a thrown error. `split`/`join` rather than `replace(new RegExp(token))`
+ * deliberately avoids the escaping bug a raw token string would cause if it
+ * contains regex metacharacters.
+ *
+ * This is defence-in-depth, not the containment boundary, and it has real
+ * limits: it does not catch a URL-encoded or otherwise transformed copy of
+ * the token (no practical risk today — installation tokens are URL-safe —
+ * but nothing here would notice if that changed), and it cannot help at all
+ * with output streamed live to a log, since it only ever runs once against
+ * the final string a `Runner` call resolves with; anything a concrete
+ * `Runner` echoes to a CI-visible sink before returning has already leaked
+ * by the time this function sees anything. The primary defence is that
+ * `runValidation` never builds a token-bearing string in the first place —
+ * `clone` is its own `RunnerIo` method precisely so cloning never goes
+ * through a command line `token` could be interpolated into. `redact()`
+ * only guards against the customer's own build/test tools echoing the
+ * token in their output, which is outside this file's control.
  */
 function redact(text: string, token: string): string {
   return token.length > 0 ? text.split(token).join("[redacted]") : text;
@@ -87,7 +92,7 @@ export async function runValidation(
 
   for (const repo of request.repos) {
     try {
-      await io.clone(repo, token, join(root, memberDirFor(repo)));
+      await io.clone(repo, token, join(root, memberDir({ repo })));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`clone failed for ${repo}: ${redact(message, token)}`);
@@ -111,9 +116,15 @@ export async function runValidation(
   // The false-PASS guard — before any build or test runs, not after.
   assertLinked(root, request.changeset);
 
+  // request.changeset is dependency order by construction: computeChangeset
+  // (src/graph/changeset.ts) is its sole producer, and it pushes entries by
+  // iterating pre-ordered levels — there is no separate sort to keep in sync
+  // here, but nothing stops a future caller from constructing a
+  // ValidationRequest some other way, so this is the invariant this loop
+  // relies on.
   const results: ValidationResult[] = [];
   for (const entry of request.changeset) {
-    const cwd = join(root, memberDirFor(entry.repo));
+    const cwd = join(root, memberDir(entry));
     const built = await io.run(["bun", "run", "build"], cwd);
     const tested = built.code === 0 ? await io.run(["bun", "test"], cwd) : built;
     const ok = tested.code === 0;
@@ -129,5 +140,5 @@ export async function runValidation(
 }
 
 function manifestPathFor(root: string, entry: ChangesetEntry): string {
-  return join(root, memberDirFor(entry.repo), "package.json");
+  return join(root, memberDir(entry), "package.json");
 }

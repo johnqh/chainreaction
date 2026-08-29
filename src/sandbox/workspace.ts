@@ -13,7 +13,7 @@ export interface ValidationResult {
   output: string;
 }
 
-const memberDir = (entry: ChangesetEntry) => `repos/${entry.repo.split("/")[1]}`;
+export const memberDir = (entry: { repo: string }) => `repos/${entry.repo.split("/")[1]}`;
 
 export function applyEntry(entry: ChangesetEntry, manifest: any): any {
   const next = structuredClone(manifest);
