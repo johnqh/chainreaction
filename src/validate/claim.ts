@@ -51,19 +51,44 @@ export async function handleClaim(
   // for it. Whether it belongs in *this* cascade is a fact only the pending
   // claim knows, and checking it is what stands between "a valid CI run"
   // and "a valid CI run for the right repository".
+  //
+  // This is a name comparison, not an id comparison, and that is a
+  // deliberate gap from Task 1's standard: `verifyOidcToken` authorises the
+  // owner on `repository_owner_id` specifically because names are mutable —
+  // renamed, transferred, or freed by deletion and later reclaimed by
+  // someone else. `ValidationRequest.repos` and `ChangesetEntry` both carry
+  // only `repo: string`, with no repository id anywhere in this data model,
+  // so there is nothing better to compare against today. The residual risk
+  // this leaves is bounded: an attacker would already have to be inside the
+  // same GitHub org — `ownerId` above pins that — and would additionally
+  // have to create a repository that reuses a name freed from this cascade
+  // between the cascade being planned and this claim being made. If
+  // `ValidationRequest` ever gains repository ids, this check should move
+  // to comparing those instead.
   if (!pending.request.repos.includes(claims.repository)) {
     throw new Error(
       "claim refused: claiming repository is not part of this cascade — authorisation failed",
     );
   }
 
-  const token = await deps.tokens.get(pending.installationId);
-
-  // Single-use: flip only after the token has actually been minted, and
-  // before returning, so a replayed OIDC token (GitHub's are valid for
-  // several minutes) cannot mint a second scoped token for a claim already
-  // fulfilled.
+  // Single-use: flip *before* awaiting the mint, not after, so two calls
+  // racing on the same cascade (a replayed still-valid OIDC token fired
+  // twice, or an overlapping client retry) cannot both read `consumed ===
+  // false` before either has a chance to set it. Whichever call reaches
+  // this line first closes the window for every other racer immediately —
+  // no `await` separates the read of `consumed` above from this write.
   pending.consumed = true;
+
+  let token: string;
+  try {
+    token = await deps.tokens.get(deps.installationId);
+  } catch (err) {
+    // A transient mint failure (e.g. GitHub outage) must not permanently
+    // burn a claim that was never actually fulfilled — roll back so the
+    // same legitimate run can retry.
+    pending.consumed = false;
+    throw err;
+  }
 
   return { token, request: pending.request };
 }

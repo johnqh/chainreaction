@@ -80,11 +80,19 @@ async function generatePem(): Promise<string> {
   return `-----BEGIN PRIVATE KEY-----\n${b64}\n-----END PRIVATE KEY-----\n`;
 }
 
-/** Serves a scripted installation-token exchange; each call mints a distinct token. */
-function stubInstallationFetch(): { fetchFn: typeof fetch; calls: () => number } {
+/**
+ * Serves a scripted installation-token exchange; each call mints a distinct
+ * token. `delayMs`, when given, resolves on a later tick so two concurrent
+ * callers genuinely overlap in-flight instead of serialising — a
+ * synchronously-resolving stub would let the first call finish end to end
+ * before the second even starts, hiding a race regardless of whether it's
+ * actually closed.
+ */
+function stubInstallationFetch(delayMs = 0): { fetchFn: typeof fetch; calls: () => number } {
   let n = 0;
   const fetchFn = (async () => {
     n++;
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     return new Response(
       JSON.stringify({
         token: `installation-token-${n}`,
@@ -104,12 +112,13 @@ async function makeDeps(overrides: {
   keys?: Jwk[];
   jwksFetch?: typeof fetch;
   installationFetch?: typeof fetch;
+  installationDelayMs?: number;
   cascades?: Map<string, PendingClaim>;
 } = {}): Promise<{ deps: ClaimDeps; installationCalls?: () => number }> {
   const keys = overrides.keys ?? [];
   const jwks = new JwksCache(overrides.jwksFetch ?? stubJwksFetch(keys), JWKS_URI);
   const creds: AppCredentials = { appId: "1", privateKeyPem: await generatePem() };
-  const { fetchFn: installFetch, calls } = stubInstallationFetch();
+  const { fetchFn: installFetch, calls } = stubInstallationFetch(overrides.installationDelayMs);
   const tokens = new TokenStore(creds, overrides.installationFetch ?? installFetch);
 
   const request: ValidationRequest = {
@@ -119,12 +128,13 @@ async function makeDeps(overrides: {
   };
   const cascades =
     overrides.cascades ??
-    new Map<string, PendingClaim>([
-      ["cascade-1", { request, installationId: INSTALLATION_ID, consumed: false }],
-    ]);
+    new Map<string, PendingClaim>([["cascade-1", { request, consumed: false }]]);
 
   return {
-    deps: { jwks, tokens, cascades, audience: AUDIENCE, ownerId: OWNER_ID },
+    deps: {
+      jwks, tokens, cascades,
+      audience: AUDIENCE, ownerId: OWNER_ID, installationId: INSTALLATION_ID,
+    },
     installationCalls: calls,
   };
 }
@@ -196,6 +206,36 @@ test("refuses a second claim for the same cascade from the same run", async () =
   // Same (still-valid) OIDC token, replayed against the same cascade.
   await expect(handleClaim(token, "cascade-1", deps)).rejects.toThrow(/already claimed|consumed|single.use/i);
   // No second installation token was minted for the replay.
+  expect(installationCalls!()).toBe(1);
+});
+
+test("two concurrent claims for the same cascade: exactly one succeeds, one is refused", async () => {
+  // TOCTOU guard: a replayed still-valid OIDC token fired twice, or an
+  // overlapping client retry, must not both observe `consumed === false`
+  // and both mint. Unlike the sequential replay test above, this starts
+  // both calls before awaiting either — genuine overlap, not two calls in
+  // sequence — and the installation-token mint resolves on a later tick so
+  // the window between "authorised" and "marked consumed" would actually be
+  // exercised if it existed.
+  const pair = await generateKeyPair();
+  const jwk = await jwkFor("key-1", pair.publicKey);
+  const { deps, installationCalls } = await makeDeps({ keys: [jwk], installationDelayMs: 5 });
+  const token = await signToken(pair.privateKey, { alg: "RS256", kid: "key-1" }, baseClaims());
+
+  const [a, b] = await Promise.allSettled([
+    handleClaim(token, "cascade-1", deps),
+    handleClaim(token, "cascade-1", deps),
+  ]);
+
+  const outcomes = [a, b];
+  const fulfilled = outcomes.filter((o) => o.status === "fulfilled");
+  const rejected = outcomes.filter((o) => o.status === "rejected");
+  expect(fulfilled.length).toBe(1);
+  expect(rejected.length).toBe(1);
+  expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+    /already claimed|consumed|single.use/i,
+  );
+  // Exactly one installation token was ever minted, not two.
   expect(installationCalls!()).toBe(1);
 });
 
