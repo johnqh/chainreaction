@@ -15,8 +15,11 @@ export class InstallationRepoAdminApi implements RepoAdminApi {
     return this.fetchFn(url, {
       ...init,
       headers: {
-        authorization: `token ${token}`,
+        authorization: `Bearer ${token}`,
         accept: "application/vnd.github+json",
+        // A plain-string body defaults to text/plain per the fetch spec, but
+        // GitHub documents application/json for these mutating endpoints.
+        ...(init?.body !== undefined ? { "content-type": "application/json" } : {}),
         ...(init?.headers ?? {}),
       },
     });

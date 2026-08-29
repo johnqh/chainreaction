@@ -87,10 +87,51 @@ test("enableAutoMerge PATCHes the repo", async () => {
   expect(JSON.parse(String(calls[0]!.init!.body))).toEqual({ allow_auto_merge: true });
 });
 
-test("no token reaches an error message", async () => {
-  const { fn } = stub(() => new Response(JSON.stringify({ message: "boom" }), { status: 500 }));
-  const api = new InstallationRepoAdminApi(async () => "super-secret-token", 1, fn);
-  let msg = "";
-  try { await api.getRepo("acme/lib"); } catch (e) { msg = (e as Error).message; }
-  expect(msg).not.toContain("super-secret-token");
+test("mutating requests (PUT/PATCH) send an explicit JSON content-type header", async () => {
+  const { fn, calls } = stub(() => new Response("{}", { status: 200 }));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await api.setProtection("acme/lib", "main", ["ci"]);
+  await api.enableAutoMerge("acme/lib");
+  expect((calls[0]!.init!.headers as Record<string, string>)["content-type"]).toBe("application/json");
+  expect((calls[1]!.init!.headers as Record<string, string>)["content-type"]).toBe("application/json");
+});
+
+test("a bodyless GET does not send a content-type header", async () => {
+  const { fn, calls } = stub(() => new Response(
+    JSON.stringify({ default_branch: "main", private: false }),
+    { status: 200 },
+  ));
+  const api = new InstallationRepoAdminApi(token, 1, fn);
+  await api.getRepo("acme/lib");
+  expect((calls[0]!.init!.headers as Record<string, string>)["content-type"]).toBeUndefined();
+});
+
+test("no token reaches an error message from any throwing method", async () => {
+  const secretToken = "super-secret-token";
+  const mkApi = (status: number) =>
+    new InstallationRepoAdminApi(
+      async () => secretToken,
+      1,
+      stub(() => new Response(JSON.stringify({ message: "boom", token: secretToken }), { status })).fn,
+    );
+
+  // Every method in this class that can throw, exercised with a status that
+  // makes it throw. Adding a sixth throwing method without extending this
+  // list should be the obvious next step, not a silent gap.
+  const attempts: Array<() => Promise<unknown>> = [
+    () => mkApi(500).getRepo("acme/lib"),
+    () => mkApi(500).hasFile("acme/lib", "a.yml"),
+    () => mkApi(500).setProtection("acme/lib", "main", ["ci"]),
+    () => mkApi(500).enableAutoMerge("acme/lib"),
+  ];
+
+  for (const attempt of attempts) {
+    let msg = "";
+    try {
+      await attempt();
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).not.toContain(secretToken);
+  }
 });
