@@ -124,6 +124,92 @@ test("deps.plan(...) never calls enableAutoMerge or setProtection", async () => 
   expect(mutations).toEqual([]);
 });
 
+test("the PreparedProvider probes repos sequentially, never more than one in flight", async () => {
+  // FIX 1: assessRepo -> probeRepo fires 3 requests per repo (getRepo, then
+  // getProtection + hasFile in parallel). A provider that maps repos through
+  // Promise.all therefore fires 3N concurrent requests, which is exactly the
+  // shape GitHub's secondary rate limits key on. This test proves the
+  // provider processes one repo's assessRepo to completion before starting
+  // the next.
+  //
+  // It tracks concurrency only on the bare "GET /repos/{owner}/{repo}" call
+  // (probeRepo's first call, getRepo) rather than every fetch. getProtection
+  // and hasFile are *deliberately* concurrent within a single repo's probe
+  // (probe.ts's own Promise.all, untouched by this fix) — tracking every
+  // fetch would show a max of 2 even against a correctly sequential
+  // provider, a false failure unrelated to what this fix changes. The
+  // getRepo call is the one request that only overlaps across repos, so it
+  // isolates cross-repo concurrency specifically.
+  //
+  // A synthetic delay is required on that endpoint: a fetch stub with no
+  // internal `await` runs its entire body synchronously once invoked, so
+  // even `Promise.all([a(), b()])` could never show visible overlap without
+  // a real suspension point — exactly like the earlier stubs in this file.
+  // The delay makes concurrent invocations genuinely interleave, the way
+  // real network latency would, which is what makes this test able to fail
+  // against the parallel (`Promise.all(repos.map(...))`) implementation:
+  // there, all three repos' getRepo calls fire before any of the three
+  // 5ms delays resolve, so all three are in flight at once and
+  // maxInFlight reaches 3 instead of 1.
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const bareRepoGet = /\/repos\/[^/]+\/[^/]+$/;
+
+  const manifests: Record<string, string> = {
+    "acme/a": JSON.stringify({ name: "@acme/a", version: "1.0.0" }),
+    "acme/b": JSON.stringify({ name: "@acme/b", version: "1.0.0", dependencies: { "@acme/a": "^1.0.0" } }),
+    "acme/c": JSON.stringify({ name: "@acme/c", version: "1.0.0", dependencies: { "@acme/a": "^1.0.0" } }),
+  };
+
+  const fetchFn = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+
+    if (method === "POST" && url.includes("/access_tokens")) {
+      return new Response(
+        JSON.stringify({ token: "test-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }),
+        { status: 201 },
+      );
+    }
+    if (url.includes("/installation/repositories")) {
+      return new Response(
+        JSON.stringify({
+          repositories: Object.keys(manifests).map((r) => ({ full_name: r, private: false, default_branch: "main" })),
+        }),
+        { status: 200 },
+      );
+    }
+    const manifestMatch = /\/repos\/([^/]+\/[^/]+)\/contents\/package\.json$/.exec(url);
+    if (manifestMatch) {
+      return new Response(manifests[manifestMatch[1]!]!, { status: 200 });
+    }
+    if (/\/contents\/\.github\/workflows\//.test(url)) {
+      return new Response("{}", { status: 200 }); // validation workflow present
+    }
+    if (/\/branches\/[^/]+\/protection$/.test(url) && method === "GET") {
+      return new Response(JSON.stringify({ message: "Branch not protected" }), { status: 404 });
+    }
+    if (bareRepoGet.test(url) && method === "GET") {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Real suspension point — see comment above.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return new Response(
+        JSON.stringify({ default_branch: "main", private: false, allow_auto_merge: false }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`stubFetch: unhandled request ${method} ${url}`);
+  }) as unknown as typeof fetch;
+
+  const deps = realDeps(await config(), fetchFn);
+  const plan = await deps.plan("@acme/a", "all");
+
+  expect([...plan.affected].sort()).toEqual(["@acme/a", "@acme/b", "@acme/c"]);
+  expect(maxInFlight).toBe(1);
+});
+
 test("the PreparedProvider handed to planCascade is called with exactly the repo set planCascade computed", async () => {
   const { fetchFn, calls } = stubFetch({
     repos: ["acme/lib", "acme/other"],
