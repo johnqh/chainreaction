@@ -68,6 +68,14 @@ export function planUpdateChain(
   levels.forEach((level, index) => {
     for (const member of level) {
       const node = graph.get(member);
+      // Unreachable today, and deliberately so: requireNode guarantees the seed
+      // is in-graph, and dependencyClosure only ever admits a member when
+      // graph.has(dep) holds, so every closure member is provably in-graph.
+      // Kept as a type guard, not as error handling. If dependencyClosure ever
+      // relaxes that gate, this silently DROPS a repo from the chain — the
+      // manifest edit is never made, its PR never opens, and everything
+      // downstream of it merges against a version that never publishes. Should
+      // that gate move, this must become a throw.
       if (!node) continue;
       const toVersion = bumpPatch(node.version);
       newVersions.set(member, toVersion);

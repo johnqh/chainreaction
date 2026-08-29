@@ -17,10 +17,15 @@ const node = (
 
 // proj2 --devDependency of--> proj3 --dependency of--> proj5
 // i.e. proj3.devDeps = [proj2], proj5.deps = [proj3].
+//
+// proj3 also carries an out-of-graph dependency and devDependency. They are
+// deliberate: without them the chain path never exercises the `if (bumped)`
+// guard, and removing that guard leaves the whole suite green while producing
+// `"^undefined"` ranges.
 function chainGraph(): Map<string, RepoNode> {
   return new Map<string, RepoNode>([
     ["proj2", node("proj2", "1.0.0")],
-    ["proj3", node("proj3", "2.0.0", [], ["proj2"])],
+    ["proj3", node("proj3", "2.0.0", ["some-3p-tool"], ["proj2", "another-3p-lib"])],
     ["proj5", node("proj5", "3.0.0", ["proj3"])],
   ]);
 }
@@ -103,4 +108,23 @@ test("refuses a package absent from the graph", () => {
   const graph = chainGraph();
   expect(() => planUpdateOne(graph, "ghost")).toThrow(/ghost/);
   expect(() => planUpdateChain(graph, "ghost")).toThrow(/ghost/);
+});
+
+test("planUpdateChain leaves out-of-graph dependencies of a chain member untouched", () => {
+  const graph = chainGraph();
+  const entries = planUpdateChain(graph, "proj5");
+  const proj3 = entries.find((e) => e.pkg === "proj3")!;
+
+  // proj3 depends on some-3p-tool and another-3p-lib, neither of which is in
+  // the graph and neither of which this cascade publishes. They must not appear
+  // in depBumps at all. Writing them unconditionally yields "^undefined" — a
+  // range that is wrong but plausible enough to open a PR and merge.
+  expect(proj3.depBumps["some-3p-tool"]).toBeUndefined();
+  expect(proj3.depBumps["another-3p-lib"]).toBeUndefined();
+  expect(Object.keys(proj3.depBumps)).toEqual(["proj2"]);
+  for (const entry of entries) {
+    for (const range of Object.values(entry.depBumps)) {
+      expect(range).not.toContain("undefined");
+    }
+  }
 });
