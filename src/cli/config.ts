@@ -107,3 +107,48 @@ export function loadConfig(
 
   return { appId, privateKeyPem, installationId, scope, requiredChecks };
 }
+
+export interface OAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  sessionSecret: string;
+  callbackUrl: string;
+}
+
+/**
+ * Reads and validates the environment the hosted web login flow needs: the
+ * GitHub OAuth App's client id/secret, the secret used to sign session
+ * cookies, and the callback URL registered with GitHub.
+ *
+ * Like `loadConfig`, this never echoes a secret's value back in an error —
+ * only the name of the missing/invalid variable — since `clientSecret` and
+ * `sessionSecret` must never appear in a log line or thrown message.
+ */
+export function loadOAuthConfig(env: Env): OAuthConfig {
+  const clientId = required(env, "CR_OAUTH_CLIENT_ID", "the GitHub OAuth App's client ID");
+  const clientSecret = required(
+    env,
+    "CR_OAUTH_CLIENT_SECRET",
+    "the GitHub OAuth App's client secret",
+  );
+  const sessionSecret = required(
+    env,
+    "CR_SESSION_SECRET",
+    "a random secret used to sign session cookies, e.g. the output of `openssl rand -hex 32`",
+  );
+  const callbackUrl = required(
+    env,
+    "CR_OAUTH_CALLBACK_URL",
+    'the full callback URL registered with the GitHub OAuth App, e.g. "https://app.example.com/auth/callback"',
+  );
+
+  try {
+    new URL(callbackUrl);
+  } catch {
+    throw new Error(
+      `CR_OAUTH_CALLBACK_URL must be an absolute URL — got ${JSON.stringify(callbackUrl)}.`,
+    );
+  }
+
+  return { clientId, clientSecret, sessionSecret, callbackUrl };
+}
