@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { assertPrepared } from "../../src/plan/readiness";
+import { assertPrepared, participationBlocker } from "../../src/plan/readiness";
 import type { PrepareResult } from "../../src/prepare/types";
 
 const ok = (repo: string): PrepareResult =>
@@ -48,4 +48,18 @@ test("a repo that is ready:true via control-plane merge is still refused — tha
 test("refuses to certify an empty repository set", () => {
   const m = new Map([["acme/a", ok("acme/a")]]);
   expect(() => assertPrepared(m, [])).toThrow(/empty repository set/);
+});
+
+// --- FIX 2: participationBlocker is the single definition both sides use ---
+
+test("participationBlocker: a ready auto-merge repo has no blocker", () => {
+  expect(participationBlocker(ok("acme/a"))).toBeUndefined();
+});
+
+test("participationBlocker: an unready repo's blocker is its own blockers list", () => {
+  expect(participationBlocker(bad("acme/a", "missing workflow"))).toBe("missing workflow");
+});
+
+test("participationBlocker: a ready control-plane repo is still blocked from taking part", () => {
+  expect(participationBlocker(controlPlane("acme/a"))).toMatch(/control-plane merge/);
 });

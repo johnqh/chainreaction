@@ -31,6 +31,21 @@ test("prepare exits non-zero and prints every blocker when a repo is not ready",
   expect(d.lines.join("\n")).toContain("no required check");
 });
 
+test("prepare exits non-zero for a control-plane repo, naming why it cannot take part yet", async () => {
+  // ready:true / mechanism:"control-plane" is a real, distinct state: the probe
+  // found no blockers, but the fallback mechanism (control-plane merge) is not
+  // implemented yet, so the repo cannot actually take part in a cascade today.
+  // Printing "ready" here is the exact contradiction plan's own gate rejects.
+  const d = deps({
+    prepare: async (repo) => ({ repo, ready: true, mechanism: "control-plane", blockers: [] }),
+  });
+  const code = await runCli(["prepare", "acme/private-lib"], d);
+  expect(code).not.toBe(0);
+  const out = d.lines.join("\n");
+  expect(out).toContain("acme/private-lib");
+  expect(out).toMatch(/control-plane/);
+});
+
 test("plan prints the levels in dependency order", async () => {
   const d = deps({
     plan: async () => ({

@@ -1,6 +1,35 @@
 import type { PrepareResult } from "../prepare/types";
 
 /**
+ * The single definition of "can take part in a cascade today".
+ *
+ * `prepareRepo` answers a narrower question — "did the probe find a blocker?" —
+ * and reports `ready: true` for a free-tier private repo, because control-plane
+ * merge is a real, working fallback mechanism, just not one Plan D has wired up
+ * yet. Every caller that needs to know "can this repo actually take part right
+ * now" (the readiness gate, and the CLI's own `prepare` reporting) must go
+ * through this function instead of re-deriving the same two checks inline —
+ * two definitions of "ready" is exactly how `prepare` came to certify a repo
+ * that `plan` then always refuses.
+ *
+ * Returns `undefined` when the repo can take part; otherwise a human-readable
+ * reason it cannot.
+ */
+export function participationBlocker(r: PrepareResult): string | undefined {
+  if (!r.ready) return r.blockers.join("; ");
+  if (r.mechanism === "control-plane")
+    // control-plane merge is Plan D, not implemented yet. Recording the
+    // fallback mechanism is what Prepare is meant to do; certifying it as
+    // ready to participate is not — a control-plane repo's PR never merges
+    // today, and every level below it waits forever.
+    //
+    // Delete this check in Plan D, once the check_suite watcher lands and
+    // can actually merge control-plane repos itself.
+    return "needs control-plane merge, which is not implemented yet";
+  return undefined;
+}
+
+/**
  * Refuse to plan a cascade that includes a repository which cannot take part.
  *
  * An unprepared repo does not fail at launch — it fails silently in the middle,
@@ -26,21 +55,8 @@ export function assertPrepared(
       problems.push(`${repo}: never prepared`);
       continue;
     }
-    if (!result.ready) {
-      problems.push(`${repo}: ${result.blockers.join("; ")}`);
-      continue;
-    }
-    if (result.mechanism === "control-plane") {
-      // control-plane merge is Plan D, not implemented yet. Recording the
-      // fallback mechanism is what Prepare is meant to do; certifying it as
-      // ready is not — a control-plane repo's PR never merges today, and
-      // every level below it waits forever.
-      //
-      // Delete this check in Plan D, once the check_suite watcher lands and
-      // can actually merge control-plane repos itself.
-      problems.push(`${repo}: needs control-plane merge, which is not implemented yet`);
-      continue;
-    }
+    const blocker = participationBlocker(result);
+    if (blocker) problems.push(`${repo}: ${blocker}`);
   }
   if (problems.length > 0) {
     throw new Error(

@@ -1,5 +1,6 @@
 import type { PrepareResult } from "../prepare/types";
 import type { CascadePlan } from "../plan/planCascade";
+import { participationBlocker } from "../plan/readiness";
 
 const EXIT_OK = 0;
 const EXIT_ERROR = 1;
@@ -34,8 +35,18 @@ async function runPrepare(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   if (result.ready) {
-    deps.log(`${result.repo}: ready (${result.mechanism})`);
-    return EXIT_OK;
+    // ready:true from the probe is not the same question as "can this repo
+    // take part in a cascade today" — a control-plane repo passes the probe
+    // but has no merge mechanism implemented yet. participationBlocker is the
+    // one place that distinction is made; without it, prepare would print
+    // "ready" for exactly the repo plan is about to refuse.
+    const blocker = participationBlocker(result);
+    if (!blocker) {
+      deps.log(`${result.repo}: ready (${result.mechanism})`);
+      return EXIT_OK;
+    }
+    deps.log(`${result.repo}: prepared, but cannot take part yet (${blocker})`);
+    return EXIT_ERROR;
   }
 
   deps.log(`${result.repo}: not ready (${result.mechanism})`);
@@ -91,7 +102,10 @@ function printPlan(plan: CascadePlan, deps: CliDeps): void {
 
   if (plan.skipped.length > 0) {
     deps.log("");
-    deps.log("skipped repositories (dropped from the graph, not published):");
+    deps.log(
+      "skipped repositories (dropped from the graph — any dependents reachable only " +
+        "through them are also missing from this plan, not just these repos themselves):",
+    );
     for (const skip of plan.skipped) {
       deps.log(`  - ${skip.repo}: ${skip.reason}`);
     }
