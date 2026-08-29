@@ -1,8 +1,11 @@
 import type { GraphSource } from "../graph/source";
 import type { ChangesetEntry } from "../graph/types";
 import type { SkippedRepo } from "../graph/githubSource";
+import type { PrepareResult } from "../prepare/types";
 import { affectedSubgraph, topoLevels } from "../graph/resolver";
 import { assertScoped, computeChangeset } from "../graph/changeset";
+import { assertPrepared } from "./readiness";
+import { reposForPackages } from "../graph/mapping";
 
 export interface CascadePlan {
   changed: string;
@@ -16,6 +19,7 @@ export async function planCascade(
   source: GraphSource,
   changed: string,
   targets: string[] | "all",
+  prepared: Map<string, PrepareResult>,
 ): Promise<CascadePlan> {
   const graph = await source.load();
   if (!graph.has(changed)) {
@@ -25,6 +29,10 @@ export async function planCascade(
   const affected = affectedSubgraph(graph, changed);
   // Before anything else: refuse to plan a publish nobody scoped.
   assertScoped(affected, targets);
+
+  // Gate before anything is planned. A plan that reaches computeChangeset has
+  // already assigned version numbers to repos it may not be allowed to touch.
+  assertPrepared(prepared, reposForPackages(graph, affected));
 
   const levels = topoLevels(graph, affected);
   // Feature-detect: only a source that tracks skipped repos (e.g.
