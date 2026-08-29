@@ -70,6 +70,27 @@ test("with nothing selected, shows a placeholder and no action buttons", () => {
   expect(screen.queryByTestId("updates-actions")).toBeNull();
 });
 
+test("plain Update calls onPlanUpdate, not onPlanUpdateChain, and proposes its result", async () => {
+  const updateEntries = [
+    entry({ pkg: "app", repo: "acme/app", fromVersion: "2.0.0", toVersion: "2.0.1" }),
+  ];
+  const planUpdate = calls(async (_pkg: string) => updateEntries);
+  const planChain = calls(async (_pkg: string) => chainEntries());
+  render(
+    <Updates {...baseProps({ onPlanUpdate: planUpdate.fn, onPlanUpdateChain: planChain.fn })} />,
+  );
+
+  fireEvent.click(screen.getByText("Update"));
+
+  const proposal = await screen.findByTestId("updates-proposal");
+  expect(proposal.querySelector("p")?.textContent).toBe(
+    "Proposed update — 1 repo(s). Nothing has been opened yet.",
+  );
+  expect(planUpdate.log.length).toBe(1);
+  expect(planUpdate.log[0]?.[0]).toBe("app");
+  expect(planChain.log.length).toBe(0);
+});
+
 test("Update Chain proposes the changeset and does NOT open any PR before confirmation", async () => {
   const plan = calls(async (_pkg: string) => chainEntries());
   const open = calls(async (_entries: ChangesetEntry[]) => prMap());
@@ -82,7 +103,9 @@ test("Update Chain proposes the changeset and does NOT open any PR before confir
   fireEvent.click(screen.getByText("Update Chain"));
 
   const proposal = await screen.findByTestId("updates-proposal");
-  expect(proposal.textContent).toContain("3 repo(s)");
+  expect(proposal.querySelector("p")?.textContent).toBe(
+    "Proposed update chain — 3 repo(s). Nothing has been opened yet.",
+  );
   expect(screen.getByTestId("proposal-bump-acme/core").textContent).toBe("1.0.0 → 1.0.1");
   expect(screen.getByTestId("proposal-bump-acme/app").textContent).toBe("2.0.0 → 2.0.1");
   expect(screen.getByTestId("proposal-bump-acme/tool").textContent).toBe("3.0.0 → 3.0.1");
@@ -107,7 +130,7 @@ test("confirming opens exactly the proposed entries, once", async () => {
   await screen.findByTestId("updates-open");
   expect(open.log.length).toBe(1);
   expect(open.log[0]?.[0]).toEqual(chainEntries());
-  expect(screen.getByTestId("pr-number-acme/core").textContent).toContain("101");
+  expect(screen.getByTestId("pr-number-acme/core").textContent).toBe(" PR #101");
   expect(screen.queryByTestId("updates-proposal")).toBeNull();
 });
 
@@ -154,12 +177,17 @@ test("PR rows are coloured by classifyPr's real classification, not by depBumps 
   expect(screen.getByTestId("pr-row-acme/tool").getAttribute("data-state")).toBe("ready");
 });
 
-test("a blocked PR names what it is waiting for, not just the word 'blocked'", async () => {
+test("a blocked PR names exactly what it is waiting for — no more, no less", async () => {
   await renderOpen();
   const waiting = screen.getByTestId("pr-waiting-acme/app").textContent ?? "";
-  expect(waiting).toContain("core");
-  // Must be more specific than the bare word alone would communicate.
-  expect(waiting.toLowerCase()).toContain("waiting for");
+  // Exact match, not toContain: `app` only depends (in-chain) on `core`.
+  // `tool` is also open and unpublished, but has no dependency relationship
+  // to `app` at all, so it must never be named as something app is waiting
+  // on — an over-inclusive computation (e.g. "every other unpublished
+  // in-chain package") would pass a toContain("core") check while still
+  // being wrong, and would falsely blame `tool` here.
+  expect(waiting).toBe(" — waiting for: core");
+  expect(waiting).not.toContain("tool");
   // No merge button on a blocked PR.
   expect(screen.queryByTestId("merge-acme/app")).toBeNull();
 });
@@ -192,7 +220,7 @@ test("Auto Merge success reports the count and marks merged entries", async () =
 
   fireEvent.click(screen.getByTestId("auto-merge"));
   const banner = await screen.findByTestId("train-outcome");
-  expect(banner.textContent).toContain("1 merged");
+  expect(banner.textContent).toBe("Auto Merge complete — 1 merged.");
   expect(screen.getByTestId("pr-row-acme/core").getAttribute("data-state")).toBe("merged");
 });
 
@@ -208,8 +236,9 @@ test("Auto Merge stall names the stuck package and the reason, and colours it fa
 
   fireEvent.click(screen.getByTestId("auto-merge"));
   const banner = await screen.findByTestId("train-outcome");
-  expect(banner.textContent).toContain("app");
-  expect(banner.textContent).toContain("core");
+  expect(banner.textContent).toBe(
+    "Auto Merge stalled: app is blocked — waiting for upstream package(s) to publish: core",
+  );
   expect(screen.getByTestId("pr-row-acme/app").getAttribute("data-state")).toBe("failed");
 });
 
