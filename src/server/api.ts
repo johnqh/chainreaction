@@ -28,6 +28,7 @@ import { planUpdateOne, planUpdateChain } from "../plan/planUpdate";
 import { openUpdatePrs, classifyPr, type PrState } from "../pr/lifecycle";
 import { runTrain, type TrainDeps, type TrainOutcome } from "../pr/train";
 import type { ChangesetEntry, RepoNode } from "../graph/types";
+import { bumpPatch } from "../graph/changeset";
 import { classifyEdges } from "../web/graphModel";
 import { applyEntry } from "../sandbox/workspace";
 
@@ -167,20 +168,82 @@ function parseUpdateBody(raw: unknown): UpdateRequestBody | null {
   return { pkg, mode };
 }
 
+// Allowlist grammar, not a denylist: a client-authored `toVersion`/`depBumps`
+// value is committed verbatim into a customer's package.json (see
+// `openPrForEntry` -> `applyEntry`), and CI then runs `bun install` against
+// it holding an npm publish token. A denylist of bad prefixes ("git", "http:",
+// ...) would be a permanent game of whack-a-mole against every scheme/protocol
+// bun's resolver understands, today and in the future; an allowlist that only
+// ever matches a bare plain-semver version (`toVersion`) or a caret/tilde/bare
+// semver range (`depBumps` values) cannot be bypassed by a scheme we forgot to
+// list, because nothing outside the allowed shape can match at all.
+const PLAIN_SEMVER = /^\d+\.\d+\.\d+$/;
+const SEMVER_RANGE = /^[\^~]?\d+\.\d+\.\d+$/;
+
 function isChangesetEntry(v: unknown): v is ChangesetEntry {
   if (!isRecord(v)) return false;
   if (typeof v["pkg"] !== "string" || v["pkg"].length === 0) return false;
   if (typeof v["repo"] !== "string" || v["repo"].length === 0) return false;
   if (typeof v["fromVersion"] !== "string") return false;
-  if (typeof v["toVersion"] !== "string") return false;
+  if (typeof v["toVersion"] !== "string" || !PLAIN_SEMVER.test(v["toVersion"])) return false;
   if (typeof v["level"] !== "number") return false;
   if (v["dir"] !== undefined && typeof v["dir"] !== "string") return false;
   const depBumps = v["depBumps"];
   if (!isRecord(depBumps)) return false;
   for (const value of Object.values(depBumps)) {
-    if (typeof value !== "string") return false;
+    if (typeof value !== "string" || !SEMVER_RANGE.test(value)) return false;
   }
   return true;
+}
+
+/**
+ * Defence in depth behind `isChangesetEntry`'s format check: even a
+ * well-formed (plain-semver, in-range-syntax) entry must still be something
+ * the graph would actually produce. Re-derives the two graph-dependent facts
+ * `applyEntry` trusts — `toVersion` and which packages `depBumps` may name —
+ * and rejects anything that disagrees.
+ *
+ * Deliberately not a full re-run of `planUpdateOne`/`planUpdateChain`: this
+ * route receives one flat `entries[]` array with no `pkg`/`mode` telling it
+ * which planner (or which root) produced it, and a chain's later-level
+ * `depBumps` values are intentionally built from *other entries'* bumped
+ * versions rather than the graph's current ones (see `planUpdateChain`'s own
+ * doc comment) — replaying that sequencing here would mean reimplementing
+ * the planner just to re-validate its output. What *is* cheap and load-
+ * bearing to check, per package, against the graph alone:
+ *   - `toVersion` is exactly `bumpPatch` of that package's current graph
+ *     version (true for every entry produced by either planner, at every
+ *     chain level, since each package always bumps its own current version);
+ *   - every `depBumps` key actually names an in-graph dependency (`deps` or
+ *     `devDeps`) of that package, so a key cannot be invented or pointed at
+ *     an unrelated package.
+ * This does not re-verify a chain-interior `depBumps` *value* against the
+ * exact bumped version a full replay would compute, but that value has
+ * already survived `isChangesetEntry`'s allowlist, so the worst it can be at
+ * this point is a syntactically valid but wrong version number for a
+ * genuine, in-graph dependency — not an arbitrary string.
+ */
+function validateEntriesAgainstGraph(
+  entries: ChangesetEntry[],
+  graph: Map<string, RepoNode>,
+): string | null {
+  for (const entry of entries) {
+    const node = graph.get(entry.pkg);
+    if (!node) {
+      return `${entry.pkg} is not in the dependency graph`;
+    }
+    const expected = bumpPatch(node.version);
+    if (entry.toVersion !== expected) {
+      return `${entry.pkg}: toVersion "${entry.toVersion}" does not match the graph-derived bump "${expected}"`;
+    }
+    const edges = new Set([...node.deps, ...(node.devDeps ?? [])]);
+    for (const dep of Object.keys(entry.depBumps)) {
+      if (!edges.has(dep)) {
+        return `${entry.pkg}: depBumps names "${dep}", which is not a dependency of ${entry.pkg} in the graph`;
+      }
+    }
+  }
+  return null;
 }
 
 function parseEntriesBody(raw: unknown): ChangesetEntry[] | null {
@@ -367,7 +430,12 @@ async function openPrForEntry(
   return pr;
 }
 
-async function handlePrs(req: Request, apis: InstallationApis, _deps: ApiDeps): Promise<Response> {
+async function handlePrs(
+  req: Request,
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+): Promise<Response> {
   const raw = await readJsonBody(req);
   const entries = parseEntriesBody(raw);
   if (!entries) {
@@ -390,6 +458,30 @@ async function handlePrs(req: Request, apis: InstallationApis, _deps: ApiDeps): 
       { error: `not part of this installation: ${foreign.map((e) => e.repo).join(", ")}` },
       403,
     );
+  }
+
+  // Defence in depth behind isChangesetEntry's format check (see
+  // validateEntriesAgainstGraph's doc comment): a client-hand-built changeset
+  // that is syntactically valid and names only owned repos could still lie
+  // about which version to write. Re-derive the graph fresh and reject
+  // anything that disagrees with what it actually says.
+  const scope = await deps.scopeFor(installationId);
+  const source = new GitHubGraphSource(apis.githubApi, scope);
+  let graph: Map<string, RepoNode>;
+  try {
+    graph = await source.load();
+  } catch (err) {
+    return errorResponse(err, 502);
+  }
+
+  let mismatch: string | null;
+  try {
+    mismatch = validateEntriesAgainstGraph(entries, graph);
+  } catch (err) {
+    return errorResponse(err, 502);
+  }
+  if (mismatch !== null) {
+    return jsonResponse({ error: `changeset does not match the current dependency graph: ${mismatch}` }, 400);
   }
 
   const prsMap = new Map<string, number>();
@@ -625,7 +717,9 @@ export async function handleApiRequest(
   if (url.pathname === "/api/update" && req.method === "POST") {
     return handleUpdate(req, apis, deps, session.installationId);
   }
-  if (url.pathname === "/api/prs" && req.method === "POST") return handlePrs(req, apis, deps);
+  if (url.pathname === "/api/prs" && req.method === "POST") {
+    return handlePrs(req, apis, deps, session.installationId);
+  }
   if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps);
   if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps);
   if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps);

@@ -55,8 +55,15 @@ function fakePrApi(opts: {
   mergeShouldFail?: boolean;
   /** mergePr rejects for this exact repo/pr, but prState reports it already MERGED. */
   alreadyMerged?: { repo: string; pr: number };
-} = {}): { api: PrApi; calls: string[] } {
+  /** putFile rejects for every call, simulating a GitHub-side write failure. */
+  putFileShouldFail?: boolean;
+} = {}): { api: PrApi; calls: string[]; putFileContents: Record<string, string> } {
   const calls: string[] = [];
+  // Keyed by `${full}:${path}` — the actual manifest text committed, not just
+  // that a call happened. A fake that discards `content` cannot tell "the
+  // right manifest was committed" from "the original, unbumped manifest was
+  // committed" apart, which is exactly the shape that let Critical A through.
+  const putFileContents: Record<string, string> = {};
   let nextPr = 100;
   const isAlreadyMerged = (full: string, pr: number) =>
     opts.alreadyMerged?.repo === full && opts.alreadyMerged?.pr === pr;
@@ -70,6 +77,10 @@ function fakePrApi(opts: {
     },
     putFile: async (full, branch, path, content) => {
       calls.push(`putFile:${full}:${branch}:${path}`);
+      if (opts.putFileShouldFail) {
+        throw new Error(`putFile ${full}:${path} failed: 502`);
+      }
+      putFileContents[`${full}:${path}`] = content;
     },
     openPr: async (full, head, base, title) => {
       calls.push(`openPr:${full}:${head}:${base}`);
@@ -86,7 +97,7 @@ function fakePrApi(opts: {
       return isAlreadyMerged(full, pr) ? "MERGED" : "OPEN";
     },
   };
-  return { api, calls };
+  return { api, calls, putFileContents };
 }
 
 function makeApis(over: Partial<{ github: GitHubApi; admin: RepoAdminApi; pr: PrApi }> = {}): InstallationApis {
@@ -331,6 +342,180 @@ test("POST /api/prs opens a branch/commit/PR per entry against the repo's real d
   const components = body.prs.find((p) => p.repo === "acme/components")!;
   expect(design.state).toBe("ready"); // no in-chain deps
   expect(components.state).toBe("blocked"); // depends on acme/design, not yet published
+});
+
+test("POST /api/prs commits a manifest with the bumped version and every depBump written into the right block — including an in-graph devDependency edge", async () => {
+  // A third package, @acme/toolkit, devDepends on @acme/design only — the
+  // exact shape (proj1 -> devDependency of proj2) that Critical A's own
+  // worked example uses. If applyEntry stops rewriting devDependencies, this
+  // is the fixture that catches it: the components/dependencies assertion
+  // alone would not, since that block was never broken.
+  const { api: github } = fakeGitHubApi({
+    repos: [
+      { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+      { fullName: "acme/components", private: false, defaultBranch: "trunk" },
+      { fullName: "acme/toolkit", private: false, defaultBranch: "trunk" },
+    ],
+    manifests: {
+      "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        dependencies: { "@acme/design": "^1.0.0", react: "^18.0.0" },
+      }),
+      "acme/toolkit": JSON.stringify({
+        name: "@acme/toolkit",
+        version: "3.0.0",
+        devDependencies: { "@acme/design": "^1.0.0" },
+      }),
+    },
+  });
+  const { api: pr, putFileContents } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ github, pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const entries = [
+    entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" }),
+    entry({ pkg: "@acme/components", repo: "acme/components", toVersion: "2.0.1", depBumps: { "@acme/design": "^1.0.1" } }),
+    entry({ pkg: "@acme/toolkit", repo: "acme/toolkit", fromVersion: "3.0.0", toVersion: "3.0.1", depBumps: { "@acme/design": "^1.0.1" } }),
+  ];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(200);
+
+  const design = JSON.parse(putFileContents["acme/design:package.json"]!);
+  expect(design.version).toBe("1.0.1");
+
+  const components = JSON.parse(putFileContents["acme/components:package.json"]!);
+  expect(components.version).toBe("2.0.1");
+  expect(components.dependencies["@acme/design"]).toBe("^1.0.1");
+  expect(components.dependencies.react).toBe("^18.0.0"); // untouched
+
+  const toolkit = JSON.parse(putFileContents["acme/toolkit:package.json"]!);
+  expect(toolkit.version).toBe("3.0.1");
+  expect(toolkit.devDependencies["@acme/design"]).toBe("^1.0.1");
+});
+
+test("POST /api/prs surfaces a 502 and never calls openPr when putFile rejects", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi({ putFileShouldFail: true });
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(502);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("putFile");
+  expect(prCalls.some((c) => c.startsWith("openPr"))).toBe(false);
+});
+
+test("POST /api/prs rejects a changeset whose toVersion/depBumps disagree with the current graph, even though every repo is owned and every field is well-formed", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  // Well-formed (plain semver / caret-semver-range) but not what the graph
+  // would actually produce for @acme/design (current version 1.0.0 ->
+  // bumpPatch would be 1.0.1, not 9.9.9).
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "9.9.9" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(400);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/prs rejects a depBumps key that is not an in-graph dependency of that package", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  // @acme/design has no dependencies of its own — naming @acme/components
+  // here (a real in-graph package, just not a dependency of @acme/design)
+  // must be rejected.
+  const entries = [
+    entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1", depBumps: { "@acme/components": "^2.0.1" } }),
+  ];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(400);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/prs rejects a depBumps value that is not a plain semver range (e.g. a git URL), even naming a real toVersion and a real in-graph dependency key", async () => {
+  // Isolates the format-layer (isChangesetEntry) defense from the graph-
+  // re-derivation layer: `toVersion` is exactly the graph-correct bump, and
+  // `@acme/design` genuinely is a dependency of `@acme/components`, so
+  // validateEntriesAgainstGraph's key/toVersion checks alone would let this
+  // through — only the semver-range grammar on the depBumps *value* catches
+  // the malicious git URL an attacker put in a syntactically-plausible slot.
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const raw = {
+    entries: [
+      {
+        pkg: "@acme/components",
+        repo: "acme/components",
+        toVersion: "2.0.1",
+        fromVersion: "2.0.0",
+        depBumps: { "@acme/design": "git+ssh://git@evil.example/pwn.git" },
+        level: 0,
+      },
+    ],
+  };
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify(raw) });
+  expect(res.status).toBe(400); // rejected at parse time, before any graph lookup
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/prs never opens a PR for a repo with no package.json — rejected before any GitHub write, since a manifestless repo never enters the graph", async () => {
+  const { api: github } = fakeGitHubApi({
+    manifests: {
+      "acme/design": null, // no package.json on the default branch
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        dependencies: { "@acme/design": "^1.0.0" },
+      }),
+    },
+  });
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ github, pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  // Rejected by validateEntriesAgainstGraph: a repo with no package.json
+  // never makes it into GitHubGraphSource's graph in the first place, so
+  // `@acme/design` looks like an unknown package rather than reaching
+  // openPrForEntry's own (now unreachable in this path) null-manifest guard.
+  expect(res.status).toBe(400);
+  expect(prCalls.some((c) => c.startsWith("putFile"))).toBe(false);
+  expect(prCalls.some((c) => c.startsWith("openPr"))).toBe(false);
+});
+
+test("POST /api/prs surfaces a failure and never calls putFile/openPr when createBranch rejects", async () => {
+  const { calls: prCalls } = fakePrApi();
+  const failingPr: PrApi = {
+    defaultBranchSha: async (full, branch) => `sha-${full}`,
+    createBranch: async () => {
+      throw new Error("createBranch failed: 422 reference already exists");
+    },
+    putFile: async () => {
+      throw new Error("must not be called: createBranch already failed");
+    },
+    openPr: async () => {
+      throw new Error("must not be called: createBranch already failed");
+    },
+    mergePr: async () => {},
+    prState: async () => "OPEN",
+  };
+  const { factory } = factoryFor(makeApis({ pr: failingPr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(502);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toContain("createBranch failed");
 });
 
 test("POST /api/prs refuses a changeset naming a repo outside this installation, and opens nothing", async () => {

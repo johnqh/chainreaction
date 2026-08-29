@@ -19,8 +19,29 @@ export function applyEntry(entry: ChangesetEntry, manifest: any): any {
   const next = structuredClone(manifest);
   next.version = entry.toVersion;
   for (const [dep, range] of Object.entries(entry.depBumps)) {
-    if (next.dependencies?.[dep]) next.dependencies[dep] = range;
-    if (next.peerDependencies?.[dep]) next.peerDependencies[dep] = range;
+    let applied = false;
+    if (next.dependencies?.[dep]) {
+      next.dependencies[dep] = range;
+      applied = true;
+    }
+    if (next.peerDependencies?.[dep]) {
+      next.peerDependencies[dep] = range;
+      applied = true;
+    }
+    if (next.devDependencies?.[dep]) {
+      next.devDependencies[dep] = range;
+      applied = true;
+    }
+    // A depBumps key that lands in none of the three blocks is indistinguishable
+    // from success unless it throws: the manifest gets committed, CI installs
+    // whatever range was already there, and every downstream badge still reads
+    // "ready" because classifyPr trusts the plan, not the manifest it produced.
+    if (!applied) {
+      throw new Error(
+        `applyEntry: ${entry.pkg} (${entry.repo}) has a depBumps entry for "${dep}" that appears in ` +
+          `none of dependencies, peerDependencies, or devDependencies`,
+      );
+    }
   }
   return next;
 }
