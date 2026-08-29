@@ -45,21 +45,37 @@ test("prepare does not attempt protection when it is unavailable, and still succ
 });
 
 test("a missing validation workflow blocks readiness and names the file", async () => {
-  const { a } = api({ file: false });
+  const { a, calls } = api({ file: false });
   const res = await prepareRepo(a, "acme/lib", ["ci"]);
   expect(res.ready).toBe(false);
   expect(res.blockers.join(" ")).toMatch(/chainreaction-validate\.yml/);
+  expect(calls).toEqual([]);
 });
 
 test("no required checks blocks readiness — auto-merge has nothing to wait on", async () => {
-  const { a } = api();
+  const { a, calls } = api();
   const res = await prepareRepo(a, "acme/lib", []);
   expect(res.ready).toBe(false);
   expect(res.blockers.join(" ")).toMatch(/required status check/i);
+  expect(calls).toEqual([]);
 });
 
 test("a blocked repo reports every blocker, not just the first", async () => {
   const { a } = api({ file: false });
   const res = await prepareRepo(a, "acme/lib", []);
   expect(res.blockers.length).toBe(2);
+});
+
+test("a blocked repo is left completely untouched", async () => {
+  const { a, calls } = api({ file: false });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(false);
+  expect(calls).toEqual([]);
+});
+
+test("enableAutoMerge is skipped when it is already on", async () => {
+  const { a, calls } = api({ meta: { defaultBranch: "main", isPrivate: false, allowAutoMerge: true } });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(calls).toEqual(["setProtection:ci"]);
+  expect(res.ready).toBe(true);
 });
