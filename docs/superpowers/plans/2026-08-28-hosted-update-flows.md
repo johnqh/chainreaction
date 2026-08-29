@@ -215,6 +215,75 @@ A blocked PR must say *what it is waiting for*, by name. "Blocked" alone sends s
 
 ---
 
+---
+
+> **Amendment (controller ruling, mid-execution).** Two tasks were added after a pre-flight
+> check of Tasks 5-7 found that the App has no way to write to GitHub at all, and that the
+> scope/org constraint every plan has carried since Plan A is actually violated in two files.
+> Rationale and evidence are in the execution ledger.
+
+## Task 4b: `PrApi` — GitHub writes over the installation token
+
+**Files:** `src/github/prApi.ts` (interface + installation implementation);
+modify `src/github/orchestrator.ts` and `src/supervisor/poller.ts` to accept `PrApi`;
+`src/github/client.ts` gains `implements PrApi`. Tests `tests/github/prApi.test.ts`.
+
+**Why this exists:** `GhClient` shells out to the `gh` CLI, so every PR operation
+runs as whoever is logged in on the machine. The hosted product authenticates as a
+GitHub App installation, and that path (`InstallationGitHubApi`,
+`InstallationRepoAdminApi`) is read-only. Without this task the app cannot open a
+pull request as itself.
+
+**Produces:**
+
+```ts
+export interface PrApi {
+  defaultBranchSha(full: string, branch: string): Promise<string>;
+  createBranch(full: string, branch: string, fromSha: string): Promise<void>;
+  putFile(full: string, branch: string, path: string, content: string, message: string): Promise<void>;
+  openPr(full: string, head: string, base: string, title: string, body: string): Promise<number>;
+  mergePr(full: string, pr: number): Promise<void>;
+  prState(full: string, pr: number): Promise<string>;
+}
+```
+
+**The trap:** `putFile` against the Contents API requires the **blob sha of the file
+being replaced**. Omit it and GitHub rejects the write; send a stale one and the
+write is rejected too. Read the file's sha on the branch immediately before writing.
+A `putFile` that silently no-ops leaves a branch with no manifest change, so the PR
+opens, CI passes against the OLD versions, and it merges green having changed
+nothing. That is the failure this whole product exists to prevent.
+
+**Structural note:** `GhClient` declares `private exec`, and private members defeat
+TypeScript's structural typing — an installation-backed class cannot be assigned to
+`GhClient` even with an identical public shape. The interface extraction is required,
+not cosmetic.
+
+**Tests must cover:**
+- each method issues the documented request (method, path, body) against an injected fetch
+- `putFile` sends the current blob sha, re-read immediately before the write
+- a 409/422 from `createBranch` when the branch exists is surfaced, never swallowed
+- no token appears in any thrown error message
+- `GhClient` still satisfies `PrApi` (compile-time assertion plus a behavioural test)
+
+## Task 8: the scope and the org are parameters
+
+**Files:** `src/graph/resolver.ts`, `src/web/App.tsx`, affected tests.
+
+`resolver.ts:5-6` hardcodes `const SCOPE = "@sudobility/"` and `const ORG = "johnqh"`,
+used at `:30`, `:34` and `:40`. `App.tsx:74` hardcodes `.replace("@sudobility/", "")`.
+Every plan's Global Constraints have forbidden exactly this, and the user's requirement
+is "a product for any developers to use" — which a hardcoded org is not.
+
+Thread scope and org through as parameters from existing config (`CliConfig.scope`
+already exists and `GitHubGraphSource` already takes it). No default that reintroduces
+the constant.
+
+**Tests must cover:** a graph loaded under a different scope and org resolves correctly,
+and no test fixture relies on `@sudobility` or `johnqh` to pass.
+
+---
+
 ## Cut List
 
 1. Task 6's graph layout sophistication — a level-ordered list with coloured edge labels conveys the same information.
