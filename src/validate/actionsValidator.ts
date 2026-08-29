@@ -1,12 +1,16 @@
 import type { ChangesetEntry } from "../graph/types";
 import type { ValidationResult } from "../sandbox/workspace";
-
-/** Resolves a fresh (or cached-but-valid) installation token. Matches TokenStore.get. */
-export type TokenProvider = (installationId: number) => Promise<string>;
+import { parseNextLink } from "../github/installationApi";
+import type { TokenProvider } from "../github/installationApi";
 
 /** A validator runs the full changeset through a build+test workflow and
- *  reports one result per package. `ActionsValidator` is the customer-CI
- *  implementation; a local, Bun-workspace implementation is the other. */
+ *  returns a `ValidationResult` per package. Per-package independence is
+ *  implementation-defined, not guaranteed by this interface: an
+ *  implementation MAY test each package in isolation, or it may (as
+ *  `ActionsValidator` does) run one combined verification and report its
+ *  single verdict across every entry. A caller that treats each result as
+ *  independently meaningful must confirm that of whichever implementation
+ *  it holds. */
 export interface Validator {
   validate(changeset: ChangesetEntry[]): Promise<ValidationResult[]>;
 }
@@ -41,7 +45,7 @@ interface WorkflowRun {
 }
 
 interface WorkflowRunsResponse {
-  workflow_runs: WorkflowRun[];
+  workflow_runs: unknown[];
 }
 
 /**
@@ -59,6 +63,11 @@ interface WorkflowRunsResponse {
  * any unrelated run someone else triggers right after this one dispatches;
  * id-only would report a stale run's conclusion if a previous run happened
  * to reuse (or already carry) the same cascade id.
+ *
+ * One dispatched run validates the WHOLE cross-repo changeset as a unit —
+ * there is no per-package granularity at the Actions-run level. `validate()`
+ * therefore returns one `ValidationResult` per `ChangesetEntry`, but every
+ * entry shares the same `ok`/`output`, copied from that one run's verdict.
  */
 export class ActionsValidator implements Validator {
   constructor(
@@ -134,27 +143,75 @@ export class ActionsValidator implements Validator {
     );
   }
 
+  /** Searches every page of the runs list for a match, so a busy CI repo —
+   *  the exact "second cascade validating concurrently" case the created-
+   *  after/cascade-id filters exist for — cannot push the genuine run past
+   *  page 1 and out of view. Stops at the first match; follows `Link:
+   *  rel="next"` (never a hand-rolled page counter) until one is found or
+   *  the pages run out. */
   private async findRun(cascadeId: string, dispatchedAtMs: number): Promise<WorkflowRun | undefined> {
     // GitHub's `created` filter accepts `>=ISO8601`. Applied both server-side
     // (as a query param) and again client-side below, so a server that
     // ignores or mis-parses the filter cannot smuggle a stale run past us.
     const createdFilter = encodeURIComponent(`>=${new Date(dispatchedAtMs).toISOString()}`);
-    const res = await this.request(
-      `${API_ROOT}/repos/${this.config.repo}/actions/runs?event=workflow_dispatch&created=${createdFilter}`,
-    );
-    if (!res.ok) {
-      throw new Error(`actions validator: listing runs for cascade ${cascadeId} failed: ${res.status}`);
+    let url: string | null =
+      `${API_ROOT}/repos/${this.config.repo}/actions/runs?event=workflow_dispatch&created=${createdFilter}&per_page=100`;
+
+    while (url) {
+      const res: Response = await this.request(url);
+      if (!res.ok) {
+        throw new Error(`actions validator: listing runs for cascade ${cascadeId} failed: ${res.status}`);
+      }
+      const body = (await res.json()) as Partial<WorkflowRunsResponse>;
+      if (!Array.isArray(body.workflow_runs)) {
+        throw new Error(
+          `actions validator: run list response for cascade ${cascadeId} has no workflow_runs array`,
+        );
+      }
+      for (const raw of body.workflow_runs) {
+        const run = this.parseRun(raw, cascadeId);
+        if (this.matches(run, cascadeId, dispatchedAtMs)) return run;
+      }
+      url = parseNextLink(res.headers.get("link"));
     }
-    const body = (await res.json()) as Partial<WorkflowRunsResponse>;
-    if (!Array.isArray(body.workflow_runs)) {
-      throw new Error(
-        `actions validator: run list response for cascade ${cascadeId} has no workflow_runs array`,
-      );
-    }
-    return body.workflow_runs.find(
-      (run) =>
-        new Date(run.created_at).getTime() >= dispatchedAtMs &&
-        (run.display_title.includes(cascadeId) || (run.name ?? "").includes(cascadeId)),
+    return undefined;
+  }
+
+  private matches(run: WorkflowRun, cascadeId: string, dispatchedAtMs: number): boolean {
+    return (
+      new Date(run.created_at).getTime() >= dispatchedAtMs &&
+      (run.display_title.includes(cascadeId) || (run.name ?? "").includes(cascadeId))
     );
+  }
+
+  /** Validates the shape of one run entry before anything calls `.includes()`
+   *  on it. A truncated or unexpected response should fail with a named
+   *  `actions validator: ...` error, not an opaque `TypeError` thrown from
+   *  inside a matching predicate. */
+  private parseRun(raw: unknown, cascadeId: string): WorkflowRun {
+    const r = (raw ?? {}) as Record<string, unknown>;
+    const { id, name, display_title, status, conclusion, html_url, created_at, event } = r;
+    const malformed = () =>
+      new Error(`actions validator: run list response for cascade ${cascadeId} contains a malformed run entry`);
+
+    if (typeof id !== "number") throw malformed();
+    if (name !== null && name !== undefined && typeof name !== "string") throw malformed();
+    if (typeof display_title !== "string") throw malformed();
+    if (typeof status !== "string") throw malformed();
+    if (conclusion !== null && conclusion !== undefined && typeof conclusion !== "string") throw malformed();
+    if (typeof html_url !== "string") throw malformed();
+    if (typeof created_at !== "string") throw malformed();
+    if (typeof event !== "string") throw malformed();
+
+    return {
+      id,
+      name: name ?? null,
+      display_title,
+      status,
+      conclusion: conclusion ?? null,
+      html_url,
+      created_at,
+      event,
+    };
   }
 }

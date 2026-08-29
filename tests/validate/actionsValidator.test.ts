@@ -286,3 +286,73 @@ test("no installation token appears in a thrown error", async () => {
   expect(message).not.toContain("super-secret-installation-tok");
   expect(message).not.toContain("installation-tok");
 });
+
+const API_ROOT = "https://api.github.com";
+
+test("follows pagination to find a match on page 2 — a single-request implementation would time out here", async () => {
+  const nextUrl = `${API_ROOT}/repos/acme/infra/actions/runs?event=workflow_dispatch&per_page=100&page=2`;
+  const { fn, calls } = stubFetch({
+    dispatch: () => new Response(null, { status: 204 }),
+    runs: (call) => {
+      if (call.url.includes("page=2")) {
+        return runsResponse([
+          {
+            id: 2, name: "chainreaction-validate", display_title: "cascade cid-page2",
+            status: "completed", conclusion: "success",
+            html_url: "https://github.com/acme/infra/actions/runs/2",
+            created_at: new Date(1_000).toISOString(), event: "workflow_dispatch",
+          },
+        ]);
+      }
+      // Page 1: 30 unrelated runs from concurrent activity in the CI repo,
+      // none matching this cascade. Points to page 2 via the Link header —
+      // the genuine run for this cascade lives there.
+      return new Response(
+        JSON.stringify({
+          workflow_runs: Array.from({ length: 30 }, (_, i) => ({
+            id: 100 + i, name: "chainreaction-validate", display_title: `cascade cid-other-${i}`,
+            status: "completed", conclusion: "success",
+            html_url: `https://github.com/acme/infra/actions/runs/${100 + i}`,
+            created_at: new Date(1_000).toISOString(), event: "workflow_dispatch",
+          })),
+        }),
+        { headers: { link: `<${nextUrl}>; rel="next"` } },
+      );
+    },
+  });
+  const clock = makeClock(0);
+  const validator = new ActionsValidator(
+    token,
+    { ...baseConfig, timeoutMs: 10_000, pollIntervalMs: 1_000 },
+    fn,
+    clock.now,
+    clock.sleep,
+    () => "cid-page2",
+  );
+
+  const results = await validator.validate(changeset);
+
+  expect(results.every((r) => r.ok === true)).toBe(true);
+  expect(results.every((r) => r.output.includes("runs/2"))).toBe(true);
+  const runsCalls = calls.filter((c) => c.url.includes("/actions/runs"));
+  expect(runsCalls.some((c) => c.url.includes("page=2"))).toBe(true);
+});
+
+test("throws a named error rather than an opaque TypeError when a run entry has a malformed shape", async () => {
+  const { fn } = stubFetch({
+    dispatch: () => new Response(null, { status: 204 }),
+    runs: () =>
+      new Response(JSON.stringify({
+        workflow_runs: [
+          // display_title is missing entirely — a truncated/unexpected response.
+          { id: 1, name: "chainreaction-validate", status: "completed", conclusion: "success",
+            html_url: "https://github.com/acme/infra/actions/runs/1",
+            created_at: new Date(1_000).toISOString(), event: "workflow_dispatch" },
+        ],
+      })),
+  });
+  const clock = makeClock(0);
+  const validator = new ActionsValidator(token, baseConfig, fn, clock.now, clock.sleep, () => "cid-malformed");
+
+  await expect(validator.validate(changeset)).rejects.toThrow(/actions validator:.*malformed/i);
+});
