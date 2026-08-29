@@ -3,6 +3,14 @@ import type { RepoCapabilities, ProtectionState } from "./types";
 
 export const DEFAULT_WORKFLOW_PATH = ".github/workflows/chainreaction-validate.yml";
 
+/**
+ * The status check ChainReaction requires on a participating repo's default branch.
+ * MUST match the job name in the validation workflow customers add at
+ * DEFAULT_WORKFLOW_PATH. Plan D ships that template; until then this is the single
+ * place the name is written, so it cannot be invented twice.
+ */
+export const DEFAULT_REQUIRED_CHECK = "chainreaction-validate";
+
 // GitHub's actual "protection is unavailable on this plan" message. Every other
 // 403 on this endpoint means something else entirely — Resource not accessible
 // by integration (the App lacks the Administration permission), a secondary
