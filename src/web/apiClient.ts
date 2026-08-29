@@ -83,6 +83,13 @@ export interface ApiClient {
   postMerge(repo: string, pr: number): Promise<void>;
   /** Runs the Auto Merge train to completion (or stall). */
   postTrain(entries: ChangesetEntry[], prs: Map<string, number>): Promise<TrainOutcome>;
+  /**
+   * Which of `entries`' packages are genuinely resolvable right now (an
+   * actual registry publish), not merely merged to a default branch. Used
+   * by a manual "Refresh" — never conflate this with a version comparison
+   * against `getGraph()`'s nodes, which reflects a merge, not a publish.
+   */
+  postPublished(entries: ChangesetEntry[]): Promise<Set<string>>;
 }
 
 // --- response validation (never cast) -----------------------------------------
@@ -326,6 +333,20 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         (v): v is { outcome: TrainOutcome } => isRecord(v) && isTrainOutcome(v["outcome"]),
       );
       return parsed.outcome;
+    },
+
+    async postPublished(entries) {
+      const body = await request(fetchFn, baseUrl, "/api/published", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ entries }),
+      });
+      const parsed = validated(
+        "POST /api/published",
+        body,
+        (v): v is { resolvable: string[] } => isRecord(v) && isStringArray(v["resolvable"]),
+      );
+      return new Set(parsed.resolvable);
     },
   };
 }

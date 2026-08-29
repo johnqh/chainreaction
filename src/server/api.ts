@@ -433,7 +433,18 @@ async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps)
   try {
     owned = await ownedRepos(apis);
   } catch (err) {
-    return errorResponse(err, 502);
+    // Deliberately 503, not 502: this is `ownedRepos` (a fresh `listRepos`
+    // call) failing before this merge attempt ever reaches `mergePr` — a
+    // systemic problem (the installation token exchange is broken, GitHub
+    // itself is unreachable) that has nothing to do with *this* PR. A
+    // caller that reads any non-2xx here as "this PR's merge failed" (the
+    // hosted web client does exactly that, deliberately, for the ordinary
+    // case below) would badge a perfectly healthy PR "failed" because the
+    // installation's credentials went bad — a confident, wrong, per-item
+    // diagnosis of what is actually an account-wide outage. Giving the two
+    // failure modes distinct statuses is what lets a caller tell them apart
+    // without parsing the message.
+    return errorResponse(err, 503);
   }
 
   if (!owned.has(body.repo)) {
@@ -443,6 +454,10 @@ async function handleMerge(req: Request, apis: InstallationApis, _deps: ApiDeps)
   try {
     await apis.prApi.mergePr(body.repo, body.pr);
   } catch (err) {
+    // 502: mergePr itself was reached and GitHub rejected it — an ordinary,
+    // per-PR merge failure (a required check hasn't passed, a conflict,
+    // etc.), not a systemic one. See the 503 above for the failure mode
+    // this is deliberately kept distinct from.
     return errorResponse(err, 502);
   }
 
@@ -513,6 +528,59 @@ async function handleTrain(req: Request, apis: InstallationApis, deps: ApiDeps):
   return jsonResponse({ outcome });
 }
 
+/**
+ * Which of `entries[].toVersion` are genuinely resolvable right now — i.e.
+ * actually published, not merely merged to a default branch.
+ *
+ * This exists for the manual "Refresh" action in the web UI. `GET
+ * /api/graph` reads each repo's default-branch `package.json`, so a
+ * package's version there flips the instant its bump PR *merges* — before
+ * any CI publish has run. Feeding that straight into `classifyPr` (via
+ * `published`) would let a downstream PR go `ready` and mergeable the
+ * moment its dependency's PR merges, which is exactly the merge/publish
+ * race `runTrain`'s own `isResolvable` polling (see `handleTrain` above)
+ * exists to eliminate on the Auto Merge path. This route gives the manual
+ * path the same real signal, via the same injectable `deps.isResolvable`
+ * (defaulting to a real npm registry lookup, overridden in every test so no
+ * suite run ever makes a network call) — never the graph reload.
+ */
+async function handlePublished(req: Request, apis: InstallationApis, deps: ApiDeps): Promise<Response> {
+  const raw = await readJsonBody(req);
+  const entries = parseEntriesBody(raw);
+  if (!entries) {
+    return jsonResponse({ error: "expected { entries: ChangesetEntry[] } (non-empty)" }, 400);
+  }
+
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(apis);
+  } catch (err) {
+    return errorResponse(err, 502);
+  }
+
+  // Same membership check as /api/prs, /api/merge and /api/train — a
+  // tampered changeset body must not be able to make this route probe the
+  // registry on behalf of a repo outside this installation.
+  const foreign = entries.filter((e) => !owned.has(e.repo));
+  if (foreign.length > 0) {
+    return jsonResponse(
+      { error: `not part of this installation: ${foreign.map((e) => e.repo).join(", ")}` },
+      403,
+    );
+  }
+
+  const fetchFn = deps.fetchFn ?? fetch;
+  const isResolvable = deps.isResolvable ?? defaultIsResolvable;
+  const resolvable: string[] = [];
+  for (const entry of entries) {
+    if (await isResolvable(entry, fetchFn)) {
+      resolvable.push(entry.pkg);
+    }
+  }
+
+  return jsonResponse({ resolvable });
+}
+
 // --- dispatch ------------------------------------------------------------------
 
 const API_ROUTES = new Set([
@@ -522,6 +590,7 @@ const API_ROUTES = new Set([
   "/api/prs",
   "/api/merge",
   "/api/train",
+  "/api/published",
 ]);
 
 /**
@@ -559,6 +628,7 @@ export async function handleApiRequest(
   if (url.pathname === "/api/prs" && req.method === "POST") return handlePrs(req, apis, deps);
   if (url.pathname === "/api/merge" && req.method === "POST") return handleMerge(req, apis, deps);
   if (url.pathname === "/api/train" && req.method === "POST") return handleTrain(req, apis, deps);
+  if (url.pathname === "/api/published" && req.method === "POST") return handlePublished(req, apis, deps);
 
   return jsonResponse({ error: "not found" }, 404);
 }

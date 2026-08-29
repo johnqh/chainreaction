@@ -114,23 +114,28 @@ export function Root({ client }: RootProps) {
     }
   }
 
-  // There is no dedicated "PR status" or "registry resolvable" route for
-  // the browser to call (see the route list in src/server/api.ts) — a
-  // manual Refresh's only source of truth is re-loading the graph and
-  // checking whether each entry's own version bump has landed on its
-  // repo's default branch, which is exactly what merging that entry's PR
-  // does. This can only ever report "merged" this way, never "failed": a
+  // `published` MUST come from a real registry-resolvability check
+  // (POST /api/published), never from re-reading the graph: GitHubGraphSource
+  // reads each repo's default-branch package.json, whose version flips the
+  // instant a bump PR *merges* — before any CI publish has run. Feeding that
+  // straight into `classifyPr` (via `published`) would let a downstream PR
+  // go `ready`/mergeable the moment its dependency's PR merges, reopening
+  // exactly the merge/publish race `runTrain`'s own `isResolvable` polling
+  // exists to eliminate on the Auto Merge path — see handlePublished's own
+  // doc comment in src/server/api.ts.
+  //
+  // `observed[repo] = "merged"` is a separate, narrower claim ("this PR's
+  // change landed on the default branch") that the graph reload *is* the
+  // right source for — it only ever marks "merged", never "failed": a
   // stall is something onMerge/onAutoMerge observe directly when they
   // happen, not something a version comparison can infer after the fact.
   async function onRefresh(entries: ChangesetEntry[], _prs: Map<string, number>): Promise<RefreshResult> {
-    const graph = await apiClient.getGraph();
+    const [published, graph] = await Promise.all([apiClient.postPublished(entries), apiClient.getGraph()]);
     const nodeByPkg = new Map(graph.nodes.map((n) => [n.pkg, n]));
-    const published = new Set<string>();
     const observed: Record<string, "merged" | "failed"> = {};
     for (const entry of entries) {
       const node = nodeByPkg.get(entry.pkg);
       if (node !== undefined && node.version === entry.toVersion) {
-        published.add(entry.pkg);
         observed[entry.repo] = "merged";
       }
     }

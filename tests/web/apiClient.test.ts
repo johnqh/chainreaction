@@ -119,6 +119,15 @@ test("getGraph throws on a 502, never resolving to an empty graph", async () => 
   await expect(client.getGraph()).rejects.toThrow("could not reach GitHub");
 });
 
+test("getGraph rejects a malformed (but 2xx) response instead of casting it", async () => {
+  // A node missing `deps` — a real server never sends this, but a client
+  // that cast instead of validated would hand the rest of the app a
+  // RepoNode with no `deps` array and fail somewhere far from this call.
+  const { fetchFn } = fakeFetch(() => json({ nodes: [{ pkg: "@acme/core", repo: "acme/core", version: "1.0.0" }], edges: [], skipped: [] }));
+  const client = createApiClient({ fetchFn });
+  await expect(client.getGraph()).rejects.toThrow(/expected shape/);
+});
+
 // --- postUpdate ------------------------------------------------------------------
 
 function sampleEntry(): ChangesetEntry {
@@ -155,6 +164,12 @@ test("postUpdate throws on 404 unknown package, carrying the server's message", 
   await expect(client.postUpdate("@acme/missing", "one")).rejects.toThrow("unknown package: @acme/missing");
 });
 
+test("postUpdate rejects a malformed (but 2xx) response instead of casting it", async () => {
+  const { fetchFn } = fakeFetch(() => json({ entries: [{ pkg: "@acme/app" }] }));
+  const client = createApiClient({ fetchFn });
+  await expect(client.postUpdate("@acme/app", "one")).rejects.toThrow(/expected shape/);
+});
+
 // --- postPrs ------------------------------------------------------------------
 
 test("postPrs POSTs {entries} and returns a Map keyed by repo with the exact PR numbers", async () => {
@@ -174,6 +189,15 @@ test("postPrs throws on a partial-failure 502, never returning a Map for what wa
   );
   const client = createApiClient({ fetchFn });
   await expect(client.postPrs([sampleEntry()])).rejects.toThrow("opening PR for acme/app failed: rate limited");
+});
+
+test("postPrs rejects a malformed (but 2xx) response instead of casting it", async () => {
+  // A PR entry with a `state` value classifyPr never actually produces.
+  const { fetchFn } = fakeFetch(() =>
+    json({ prs: [{ pkg: "@acme/app", repo: "acme/app", pr: 42, state: "pending" }] }),
+  );
+  const client = createApiClient({ fetchFn });
+  await expect(client.postPrs([sampleEntry()])).rejects.toThrow(/expected shape/);
 });
 
 // --- postMerge ------------------------------------------------------------------
@@ -205,6 +229,21 @@ test("postMerge throws ApiError(403) when the repo isn't part of this installati
   expect(err).toBeInstanceOf(ApiError);
   expect((err as ApiError).status).toBe(403);
   expect((err as ApiError).unauthorized).toBe(false);
+});
+
+test("postMerge surfaces a 503 (a systemic failure, not this PR's) as a distinct status from 502", async () => {
+  const { fetchFn } = fakeFetch(() => json({ error: "installation token exchange failed: bad credentials" }, 503));
+  const client = createApiClient({ fetchFn });
+  const err = await client.postMerge("acme/app", 7).catch((e) => e);
+  expect(err).toBeInstanceOf(ApiError);
+  expect((err as ApiError).status).toBe(503);
+  expect((err as Error).message).toBe("installation token exchange failed: bad credentials");
+});
+
+test("postMerge rejects a malformed (but 2xx) response instead of casting it", async () => {
+  const { fetchFn } = fakeFetch(() => json({ merged: true, repo: "acme/app" })); // missing `pr`
+  const client = createApiClient({ fetchFn });
+  await expect(client.postMerge("acme/app", 7)).rejects.toThrow(/expected shape/);
 });
 
 // --- postTrain ------------------------------------------------------------------
@@ -241,4 +280,41 @@ test("postTrain rejects an outcome missing the stalled-specific fields instead o
   const { fetchFn } = fakeFetch(() => json({ outcome: { status: "stalled", merged: [] } }));
   const client = createApiClient({ fetchFn });
   await expect(client.postTrain([sampleEntry()], new Map())).rejects.toThrow(/expected shape/);
+});
+
+// --- postPublished ------------------------------------------------------------------
+//
+// Backs the manual "Refresh" action's `published` set — the whole point of
+// this route is that it is a real registry-resolvability check, never a
+// version comparison against the graph (see Root.tsx's onRefresh and
+// handlePublished's doc comment in src/server/api.ts for the merge/publish
+// race this exists to close).
+
+test("postPublished POSTs {entries} and returns the exact resolvable set", async () => {
+  const core = { ...sampleEntry(), pkg: "@acme/core", repo: "acme/core" };
+  const app = sampleEntry();
+  const { fetchFn, calls } = fakeFetch(() => json({ resolvable: ["@acme/core"] }));
+  const client = createApiClient({ fetchFn });
+  const published = await client.postPublished([core, app]);
+  expect(calls).toEqual([{ url: "/api/published", method: "POST", body: { entries: [core, app] } }]);
+  expect(published).toEqual(new Set(["@acme/core"]));
+});
+
+test("postPublished returns an empty set (not a thrown error) when nothing is resolvable yet", async () => {
+  const { fetchFn } = fakeFetch(() => json({ resolvable: [] }));
+  const client = createApiClient({ fetchFn });
+  const published = await client.postPublished([sampleEntry()]);
+  expect(published).toEqual(new Set());
+});
+
+test("postPublished throws on a 403 (a repo outside this installation), never resolving to an empty set", async () => {
+  const { fetchFn } = fakeFetch(() => json({ error: "not part of this installation: acme/evil" }, 403));
+  const client = createApiClient({ fetchFn });
+  await expect(client.postPublished([sampleEntry()])).rejects.toThrow("not part of this installation: acme/evil");
+});
+
+test("postPublished rejects a malformed (but 2xx) response instead of casting it", async () => {
+  const { fetchFn } = fakeFetch(() => json({ resolvable: [42] })); // not a string array
+  const client = createApiClient({ fetchFn });
+  await expect(client.postPublished([sampleEntry()])).rejects.toThrow(/expected shape/);
 });
