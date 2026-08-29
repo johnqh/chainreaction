@@ -65,13 +65,26 @@ export function loadConfig(
   const installationId = Number(trimmedInstallationId);
 
   const requiredChecksRaw = env["CR_REQUIRED_CHECKS"];
-  const requiredChecks =
-    requiredChecksRaw === undefined || requiredChecksRaw.trim().length === 0
-      ? [DEFAULT_REQUIRED_CHECK]
-      : requiredChecksRaw
-          .split(",")
-          .map((c) => c.trim())
-          .filter((c) => c.length > 0);
+  let requiredChecks: string[];
+  if (requiredChecksRaw === undefined || requiredChecksRaw.trim().length === 0) {
+    requiredChecks = [DEFAULT_REQUIRED_CHECK];
+  } else {
+    requiredChecks = requiredChecksRaw
+      .split(",")
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0);
+    if (requiredChecks.length === 0) {
+      // A non-blank value that filters down to nothing (",,," and similar) is
+      // a typo, not "no override given" — the same distinction parseTargets
+      // already draws for --targets in cli/main.ts. Letting it fall through
+      // to an empty list would silently turn a malformed env var into "no
+      // required status check" on every repo, which reads as a problem with
+      // the customer's repos rather than with this variable.
+      throw new Error(
+        `CR_REQUIRED_CHECKS must be a comma-separated list of check names — got ${JSON.stringify(requiredChecksRaw)}.`,
+      );
+    }
+  }
 
   let privateKeyPem: string;
   try {

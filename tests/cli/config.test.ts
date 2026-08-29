@@ -70,6 +70,29 @@ test("CR_REQUIRED_CHECKS absent defaults to [DEFAULT_REQUIRED_CHECK]", () => {
   expect(config.requiredChecks).toEqual([DEFAULT_REQUIRED_CHECK]);
 });
 
+test("CR_REQUIRED_CHECKS that filters down to nothing is a config error, not an empty list", () => {
+  // ",,," is non-blank (passes the "is it set at all" check) but splits and
+  // trims down to zero usable entries — the same shape of bug parseTargets
+  // already guards against for --targets. Falling through to [] here would
+  // make a typo in the environment look, to prepare/plan, exactly like every
+  // repo missing its required status check.
+  const env = { ...BASE_ENV, CR_REQUIRED_CHECKS: ",,," };
+  expect(() => loadConfig(env, readFile)).toThrow(/CR_REQUIRED_CHECKS/);
+});
+
+test("CR_REQUIRED_CHECKS of only whitespace-separated commas is also a config error", () => {
+  const env = { ...BASE_ENV, CR_REQUIRED_CHECKS: " , , " };
+  expect(() => loadConfig(env, readFile)).toThrow(/CR_REQUIRED_CHECKS/);
+});
+
+test("an absent CR_REQUIRED_CHECKS and a malformed one remain distinguishable outcomes", () => {
+  // Absent -> the documented default. Malformed -> a thrown config error.
+  // These must never collapse to the same "empty list" result.
+  const absent = loadConfig(BASE_ENV, readFile);
+  expect(absent.requiredChecks).toEqual([DEFAULT_REQUIRED_CHECK]);
+  expect(() => loadConfig({ ...BASE_ENV, CR_REQUIRED_CHECKS: ",,," }, readFile)).toThrow();
+});
+
 test("a private key that cannot be read reports the path, and the error contains no key material", () => {
   const secretMarker = "SUPER-SECRET-KEY-BYTES";
   const throwingReadFile = () => {
