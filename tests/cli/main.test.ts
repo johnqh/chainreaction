@@ -41,6 +41,8 @@ test("plan prints the levels in dependency order", async () => {
   expect(await runCli(["plan", "@acme/design", "--all"], d)).toBe(0);
   const out = d.lines.join("\n");
   expect(out.indexOf("@acme/design")).toBeLessThan(out.indexOf("@acme/components"));
+  // An empty `skipped` array must print no heading at all.
+  expect(out).not.toContain("skipped repositories");
 });
 
 test("plan surfaces skipped repos rather than hiding them", async () => {
@@ -58,6 +60,40 @@ test("plan without --all or --targets refuses", async () => {
   const d = deps();
   expect(await runCli(["plan", "@acme/design"], d)).not.toBe(0);
   expect(d.lines.join("\n")).toMatch(/--all|--targets/);
+});
+
+test("plan with both --all and --targets refuses", async () => {
+  const d = deps();
+  expect(await runCli(["plan", "@acme/design", "--all", "--targets", "x"], d)).not.toBe(0);
+});
+
+test("plan with a --targets value that parses to zero entries refuses at the CLI layer", async () => {
+  const d = deps();
+  // ",,," and " , " are truthy and not flag-shaped, so a naive check lets them
+  // through; after filtering they must not be silently treated as "no targets".
+  expect(await runCli(["plan", "@acme/design", "--targets", ",,,"], d)).not.toBe(0);
+  expect(d.lines.join("\n")).toMatch(/--targets/);
+  // Never reaches the injected plan function — refused before that.
+});
+
+test("a thrown scoping error from deps.plan is reported cleanly, not as an unhandled rejection", async () => {
+  const d = deps({
+    plan: async () => {
+      throw new Error("targets do not cover the full affected set, missing: @acme/components");
+    },
+  });
+  expect(await runCli(["plan", "@acme/design", "--all"], d)).not.toBe(0);
+  expect(d.lines.join("\n")).toContain("targets do not cover the full affected set");
+});
+
+test("a thrown error from deps.prepare is reported cleanly, not as an unhandled rejection", async () => {
+  const d = deps({
+    prepare: async () => {
+      throw new Error("no such repository: acme/lib");
+    },
+  });
+  expect(await runCli(["prepare", "acme/lib"], d)).not.toBe(0);
+  expect(d.lines.join("\n")).toContain("no such repository: acme/lib");
 });
 
 test("an unknown command exits non-zero with usage", async () => {

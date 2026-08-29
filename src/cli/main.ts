@@ -25,7 +25,14 @@ async function runPrepare(argv: string[], deps: CliDeps): Promise<number> {
     return EXIT_ERROR;
   }
 
-  const result = await deps.prepare(repo);
+  let result: PrepareResult;
+  try {
+    result = await deps.prepare(repo);
+  } catch (err) {
+    deps.log(err instanceof Error ? err.message : String(err));
+    return EXIT_ERROR;
+  }
+
   if (result.ready) {
     deps.log(`${result.repo}: ready (${result.mechanism})`);
     return EXIT_OK;
@@ -59,11 +66,21 @@ function parseTargets(argv: string[]): { targets: string[] | "all" } | { error: 
   }
   if (hasAll) return { targets: "all" };
 
+  const TARGETS_ERROR = "--targets requires a comma-separated list of package names.";
   const raw = argv[targetsIndex + 1];
   if (!raw || raw.startsWith("--")) {
-    return { error: "--targets requires a comma-separated list of package names." };
+    return { error: TARGETS_ERROR };
   }
-  return { targets: raw.split(",").map((t) => t.trim()).filter((t) => t.length > 0) };
+  const targets = raw.split(",").map((t) => t.trim()).filter((t) => t.length > 0);
+  if (targets.length === 0) {
+    // "--targets ,,," and "--targets ' , '" are truthy and not flag-shaped, so
+    // they pass the check above; without this, they filter down to an empty
+    // array that is indistinguishable from "no targets given" one layer down,
+    // where a typo would be rejected by an unhandled throw instead of a
+    // clean CLI error.
+    return { error: TARGETS_ERROR };
+  }
+  return { targets };
 }
 
 function printPlan(plan: CascadePlan, deps: CliDeps): void {
@@ -94,7 +111,16 @@ async function runPlan(argv: string[], deps: CliDeps): Promise<number> {
     return EXIT_ERROR;
   }
 
-  const plan = await deps.plan(changed, scoped.targets);
+  let plan: CascadePlan;
+  try {
+    plan = await deps.plan(changed, scoped.targets);
+  } catch (err) {
+    // assertScoped and assertPrepared both throw — a legitimate guard
+    // failure must read the same as every other validation failure in this
+    // file: a clean message and an error exit, never an unhandled rejection.
+    deps.log(err instanceof Error ? err.message : String(err));
+    return EXIT_ERROR;
+  }
   printPlan(plan, deps);
   return EXIT_OK;
 }
