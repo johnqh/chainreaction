@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { loadConfig } from "../../src/cli/config";
+import { loadConfig, loadOAuthConfig } from "../../src/cli/config";
 
 const BASE_ENV: Record<string, string | undefined> = {
   CR_APP_ID: "12345",
@@ -117,4 +117,55 @@ test("a private key that cannot be read reports the path, and the error contains
   expect(message).toContain("/fake/app.pem");
   expect(message).not.toContain(secretMarker);
   expect(message).not.toMatch(/BEGIN (RSA )?PRIVATE KEY/);
+});
+
+const OAUTH_ENV: Record<string, string | undefined> = {
+  CR_OAUTH_CLIENT_ID: "client-id-abc",
+  CR_OAUTH_CLIENT_SECRET: "the-client-secret",
+  CR_SESSION_SECRET: "the-session-secret",
+  CR_OAUTH_CALLBACK_URL: "https://app.example.com/auth/callback",
+};
+
+test("loadOAuthConfig reads a valid OAuth environment", () => {
+  expect(loadOAuthConfig(OAUTH_ENV)).toEqual({
+    clientId: "client-id-abc",
+    clientSecret: "the-client-secret",
+    sessionSecret: "the-session-secret",
+    callbackUrl: "https://app.example.com/auth/callback",
+  });
+});
+
+for (const name of [
+  "CR_OAUTH_CLIENT_ID",
+  "CR_OAUTH_CLIENT_SECRET",
+  "CR_SESSION_SECRET",
+  "CR_OAUTH_CALLBACK_URL",
+]) {
+  test(`loadOAuthConfig: missing ${name} produces an error naming it`, () => {
+    const env = { ...OAUTH_ENV };
+    delete env[name];
+    expect(() => loadOAuthConfig(env)).toThrow(new RegExp(name));
+  });
+
+  test(`loadOAuthConfig: blank ${name} (whitespace only) is treated as missing`, () => {
+    const env = { ...OAUTH_ENV, [name]: "   " };
+    expect(() => loadOAuthConfig(env)).toThrow(new RegExp(name));
+  });
+}
+
+test("loadOAuthConfig rejects a non-absolute CR_OAUTH_CALLBACK_URL", () => {
+  const env = { ...OAUTH_ENV, CR_OAUTH_CALLBACK_URL: "/auth/callback" };
+  expect(() => loadOAuthConfig(env)).toThrow(/CR_OAUTH_CALLBACK_URL/);
+});
+
+test("loadOAuthConfig never echoes the client secret or session secret in a thrown message", () => {
+  const env = { ...OAUTH_ENV, CR_OAUTH_CALLBACK_URL: "not a url" };
+  let message = "";
+  try {
+    loadOAuthConfig(env);
+  } catch (err) {
+    message = (err as Error).message;
+  }
+  expect(message).not.toContain(OAUTH_ENV.CR_OAUTH_CLIENT_SECRET);
+  expect(message).not.toContain(OAUTH_ENV.CR_SESSION_SECRET);
 });
