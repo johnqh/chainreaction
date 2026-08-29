@@ -1,82 +1,66 @@
-import { useEffect, useState } from "react";
-import type { NodeState } from "../supervisor/state";
+import { useState } from "react";
+import type { RepoNode } from "../graph/types";
+import { Graph } from "./Graph";
+import { RepoList } from "./RepoList";
+import { Updates, type UpdatesProps } from "./Updates";
 
-interface Snapshot {
-  nodes: { pkg: string; repo: string; level: number; version: string; state: NodeState }[];
-  edges: { from: string; to: string }[];
+export interface AppProps {
+  /** Every repo the signed-in developer owns, shared by RepoList and Graph. */
+  nodes: RepoNode[];
+  /** Which repos are "prepared", keyed by pkg name — see RepoListProps. */
+  prepared: Record<string, boolean>;
+  onPlanUpdate: UpdatesProps["onPlanUpdate"];
+  onPlanUpdateChain: UpdatesProps["onPlanUpdateChain"];
+  onOpenPrs: UpdatesProps["onOpenPrs"];
+  onMerge: UpdatesProps["onMerge"];
+  onAutoMerge: UpdatesProps["onAutoMerge"];
+  onRefresh: UpdatesProps["onRefresh"];
 }
 
-const COLOR: Record<NodeState, string> = {
-  pending: "#3a3a3a", validated: "#4a5568", "pr-open": "#2b6cb0",
-  "ci-running": "#b7791f", merged: "#2c7a7b", published: "#2f855a", stalled: "#c53030",
-};
-
-export function App({ scope }: { scope: string }) {
-  const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [approved, setApproved] = useState(false);
-  const [token, setToken] = useState<string | null>(null);
-
-  useEffect(() => {
-    let es: EventSource | undefined;
-    let cancelled = false;
-    fetch("/api/token")
-      .then((r) => r.json())
-      .then((data: { token: string }) => {
-        if (cancelled) return;
-        setToken(data.token);
-        es = new EventSource(`/api/state?token=${encodeURIComponent(data.token)}`);
-        es.onmessage = (e) => setSnap(JSON.parse(e.data));
-      });
-    return () => {
-      cancelled = true;
-      es?.close();
-    };
-  }, []);
-
-  if (!snap) return <div style={{ padding: 32, color: "#eee" }}>connecting…</div>;
-
-  const levels = [...new Set(snap.nodes.map((n) => n.level))].sort((a, b) => a - b);
-  const stalled = snap.nodes.filter((n) => n.state === "stalled");
+/**
+ * Top-level screen: RepoList and Graph share one `selected` package, and
+ * Updates acts on whichever one is currently selected. All side effects
+ * (planning, opening PRs, merging) are callback props supplied by the
+ * caller — this component never calls `fetch` itself, so the real server
+ * wiring can land as a separate, reviewable step.
+ *
+ * This replaces the previous SSE-driven supervisor screen; see the Task 7
+ * report for why.
+ */
+export function App({
+  nodes,
+  prepared,
+  onPlanUpdate,
+  onPlanUpdateChain,
+  onOpenPrs,
+  onMerge,
+  onAutoMerge,
+  onRefresh,
+}: AppProps) {
+  const [selected, setSelected] = useState<string | null>(null);
 
   return (
-    <div style={{ background: "#111", color: "#eee", minHeight: "100vh", padding: 32,
-                  fontFamily: "ui-monospace, monospace" }}>
-      <h1 style={{ fontSize: 20, marginBottom: 4 }}>ChainReaction</h1>
-      <p style={{ opacity: 0.6, marginBottom: 24 }}>
-        {snap.nodes.length} packages · {snap.nodes.filter((n) => n.state === "published").length} published
-        {stalled.length > 0 && ` · ${stalled.length} stalled`}
-      </p>
-
-      {!approved && (
-        <button
-          onClick={() => {
-            if (!token) return;
-            fetch("/api/approve", {
-              method: "POST",
-              headers: { "X-ChainReaction-Token": token },
-            });
-            setApproved(true);
-          }}
-          style={{ background: "#2f855a", color: "#fff", border: 0, padding: "12px 24px",
-                   fontSize: 16, borderRadius: 6, cursor: "pointer", marginBottom: 32 }}
-        >
-          Approve changeset ({snap.nodes.length} repos)
-        </button>
-      )}
-
-      {levels.map((level) => (
-        <div key={level} style={{ display: "flex", gap: 12, marginBottom: 12, alignItems: "center" }}>
-          <span style={{ opacity: 0.4, width: 32 }}>L{level}</span>
-          {snap.nodes.filter((n) => n.level === level).map((n) => (
-            <div key={n.pkg} title={`${n.repo} → ${n.version}`}
-                 style={{ background: COLOR[n.state], padding: "8px 14px", borderRadius: 6,
-                          fontSize: 13, transition: "background 400ms" }}>
-              {n.pkg.replace(scope, "")}
-              <span style={{ opacity: 0.65, marginLeft: 8 }}>{n.state}</span>
-            </div>
-          ))}
+    <div style={{ background: "#111", color: "#eee", minHeight: "100vh", padding: 32, fontFamily: "ui-monospace, monospace" }}>
+      <h1 style={{ fontSize: 20, marginBottom: 24 }}>ChainReaction</h1>
+      <div style={{ display: "flex", gap: 32, alignItems: "flex-start" }}>
+        <div style={{ flex: "0 0 auto" }}>
+          <RepoList nodes={nodes} prepared={prepared} selected={selected} onSelect={setSelected} />
         </div>
-      ))}
+        <div style={{ flex: "0 0 auto" }}>
+          <Graph nodes={nodes} selected={selected} onSelect={setSelected} />
+        </div>
+        <div style={{ flex: "1 1 auto" }}>
+          <Updates
+            selected={selected}
+            onPlanUpdate={onPlanUpdate}
+            onPlanUpdateChain={onPlanUpdateChain}
+            onOpenPrs={onOpenPrs}
+            onMerge={onMerge}
+            onAutoMerge={onAutoMerge}
+            onRefresh={onRefresh}
+          />
+        </div>
+      </div>
     </div>
   );
 }
