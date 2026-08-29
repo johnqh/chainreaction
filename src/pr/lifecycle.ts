@@ -1,5 +1,5 @@
 import type { ChangesetEntry } from "../graph/types";
-import type { GhClient } from "../github/client";
+import type { PrApi } from "../github/prApi";
 import { openChangesetPrs } from "../github/orchestrator";
 
 /**
@@ -7,7 +7,7 @@ import { openChangesetPrs } from "../github/orchestrator";
  *
  * `ready` / `blocked` are computed by `classifyPr` from the changeset shape
  * alone. `merged` / `failed` are observed states — reported by GitHub via
- * `GhClient.prState` (or a supervisor watching it) — and are never produced
+ * `PrApi.prState` (or a supervisor watching it) — and are never produced
  * by `classifyPr`; nothing in this module invents them.
  */
 export type PrState = "ready" | "blocked" | "merged" | "failed";
@@ -17,14 +17,16 @@ export type PrState = "ready" | "blocked" | "merged" | "failed";
  *
  * Delegates entirely to `openChangesetPrs` — the update flow and the
  * cascade flow open PRs identically; only how the changeset was planned
- * differs.
+ * differs. `gh` is typed as `PrApi` (not the concrete `GhClient`) so the
+ * hosted flow can pass an installation-backed implementation instead.
  */
 export async function openUpdatePrs(
   entries: ChangesetEntry[],
-  gh: GhClient,
+  gh: PrApi,
   branch: string,
+  base = "main",
 ): Promise<Map<string, number>> {
-  return openChangesetPrs(entries, gh, branch);
+  return openChangesetPrs(entries, gh, branch, base);
 }
 
 /**
