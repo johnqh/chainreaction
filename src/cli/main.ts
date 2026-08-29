@@ -9,6 +9,15 @@ export interface CliDeps {
   log: (line: string) => void;
   prepare: (repo: string) => Promise<PrepareResult>;
   plan: (changed: string, targets: string[] | "all") => Promise<CascadePlan>;
+  /**
+   * Starts the hosted app and resolves only if it stops on its own —
+   * `Bun.serve()` keeps a process alive on its own listener, so a real
+   * implementation never resolves this during normal operation; a rejection
+   * before the server ever starts (e.g. missing OAuth config) is the only
+   * way this ordinarily settles. Optional so `prepare`/`plan`-only callers
+   * (and every existing test of them) never need to supply one.
+   */
+  serve?: () => Promise<number>;
 }
 
 const USAGE = [
@@ -17,6 +26,7 @@ const USAGE = [
   "commands:",
   "  prepare <owner/repo>                 check (and ready) one repo for the cascade",
   "  plan <package> (--all|--targets a,b)  plan a cascade from a changed package",
+  "  serve                                run the hosted app (GitHub login, repos, updates)",
 ].join("\n");
 
 async function runPrepare(argv: string[], deps: CliDeps): Promise<number> {
@@ -140,6 +150,23 @@ async function runPlan(argv: string[], deps: CliDeps): Promise<number> {
   return EXIT_OK;
 }
 
+async function runServe(deps: CliDeps): Promise<number> {
+  if (!deps.serve) {
+    deps.log("serve is not available: no serve implementation was wired.");
+    return EXIT_ERROR;
+  }
+  try {
+    // Never resolves during normal operation — see CliDeps.serve's doc
+    // comment. Wrapped in try/catch like every other command here so a
+    // construction failure (e.g. loadOAuthConfig rejecting a missing
+    // variable) reads as a clean CLI error, never an unhandled rejection.
+    return await deps.serve();
+  } catch (err) {
+    deps.log(err instanceof Error ? err.message : String(err));
+    return EXIT_ERROR;
+  }
+}
+
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   const [command, ...rest] = argv;
 
@@ -148,6 +175,8 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return runPrepare(rest, deps);
     case "plan":
       return runPlan(rest, deps);
+    case "serve":
+      return runServe(deps);
     default:
       deps.log(USAGE);
       return EXIT_ERROR;

@@ -1,20 +1,11 @@
 import { createRoot } from "react-dom/client";
-import { App } from "./App";
+import { Root } from "./Root";
 
-// TODO: the server-backed data/action wiring (repos, prepared status, and
-// the plan/open-PR/merge/refresh callbacks) is a separate, reviewable step —
-// see Task 7's report. The stubs below keep this entry point compiling and
-// hardcode-free (no scope/org literals) until that wiring lands; they are
-// deliberately inert rather than reaching for `fetch` themselves.
-createRoot(document.getElementById("root")!).render(
-  <App
-    nodes={[]}
-    prepared={{}}
-    onPlanUpdate={() => Promise.reject(new Error("not wired: onPlanUpdate"))}
-    onPlanUpdateChain={() => Promise.reject(new Error("not wired: onPlanUpdateChain"))}
-    onOpenPrs={() => Promise.reject(new Error("not wired: onOpenPrs"))}
-    onMerge={() => Promise.reject(new Error("not wired: onMerge"))}
-    onAutoMerge={() => Promise.reject(new Error("not wired: onAutoMerge"))}
-    onRefresh={() => Promise.reject(new Error("not wired: onRefresh"))}
-  />,
-);
+// The real entry point: Root loads repos and the dependency graph from the
+// hosted API on mount and wires every App callback to apiClient — see
+// Root.tsx for the loading/error states and the callback wiring itself.
+// Kept here as a one-line mount so Root (the actual logic) stays a plain
+// component, testable with @testing-library/react like every other screen
+// in this app instead of only being exercisable by loading this module and
+// requiring a real DOM `#root` element to exist first.
+createRoot(document.getElementById("root")!).render(<Root />);

@@ -1,6 +1,8 @@
 import { test, expect } from "bun:test";
-import { realDeps } from "../../src/cli/deps";
-import type { CliConfig } from "../../src/cli/config";
+import { realDeps, realApiDeps, realServerDeps } from "../../src/cli/deps";
+import { createServer } from "../../src/server/index";
+import { SessionStore } from "../../src/auth/session";
+import type { CliConfig, OAuthConfig } from "../../src/cli/config";
 
 async function generatePem(): Promise<string> {
   const pair = await crypto.subtle.generateKey(
@@ -256,4 +258,114 @@ test("the PreparedProvider handed to planCascade is called with exactly the repo
   expect(calls.some((c) => c.url.includes("acme/other/pulls"))).toBe(false);
 
   expect(calls.some((c) => c.method === "GET" && c.url.endsWith("/repos/acme/lib"))).toBe(true);
+});
+
+// --- realApiDeps / realServerDeps (the "chainreaction serve" wiring) -----------
+
+function oauthConfig(over: Partial<OAuthConfig> = {}): OAuthConfig {
+  return {
+    clientId: "client-id-abc",
+    clientSecret: "the-client-secret-value",
+    sessionSecret: "the-session-secret-value",
+    callbackUrl: "https://app.example.test/auth/callback",
+    ...over,
+  };
+}
+
+/** A fetchFn that fails the test the moment it is actually invoked. */
+function neverCalledFetch(): typeof fetch {
+  return (async (input: unknown) => {
+    throw new Error(`fetchFn must not be called during construction — got a request for ${String(input)}`);
+  }) as unknown as typeof fetch;
+}
+
+test("realApiDeps constructs ApisFor/scopeFor/requiredChecksFor without making any network call", async () => {
+  const cfg = await config({ scope: "@acme/", requiredChecks: ["ci", "test"] });
+  const deps = realApiDeps(cfg, neverCalledFetch());
+
+  // Building the trio for an installation must not itself reach the
+  // network — only calling one of the trio's methods should.
+  const apis = deps.apisFor(cfg.installationId);
+  expect(apis.githubApi).toBeTruthy();
+  expect(apis.adminApi).toBeTruthy();
+  expect(apis.prApi).toBeTruthy();
+
+  expect(await deps.scopeFor(cfg.installationId)).toBe("@acme/");
+  expect(await deps.requiredChecksFor(cfg.installationId)).toEqual(["ci", "test"]);
+  // scopeFor/requiredChecksFor return the one configured value for every
+  // installation id today — asserted here with a second, different id so a
+  // future accidental per-id branch doesn't slip past a test that only ever
+  // tried the configured installation's own id.
+  expect(await deps.scopeFor(999)).toBe("@acme/");
+  expect(await deps.requiredChecksFor(999)).toEqual(["ci", "test"]);
+});
+
+test("realServerDeps wires the exact OAuthConfig it was given into ServerDeps.auth — not a placeholder", async () => {
+  const cfg = await config();
+  const auth = oauthConfig();
+  const deps = realServerDeps(cfg, auth, neverCalledFetch());
+  expect(deps.auth).toEqual(auth);
+  expect(deps.api).toBeDefined();
+});
+
+test("chainreaction serve's real wiring end to end: a session signed with the loaded OAuth config's own secret is honored by the running server, and construction never reached the network", async () => {
+  // This is the test mutation (c) targets: swap in a server built without
+  // the real OAuth config (e.g. a placeholder/default sessionSecret) and
+  // this must fail, because the externally-minted cookie below is signed
+  // with the *real* `auth.sessionSecret` loadOAuthConfig would have
+  // produced from the environment.
+  const cfg = await config({ installationId: 4242 });
+  const auth = oauthConfig();
+  const deps = realServerDeps(cfg, auth, neverCalledFetch());
+
+  const server = createServer(deps, 0);
+  try {
+    const sessions = new SessionStore(auth.sessionSecret);
+    const cookie = await sessions.createSession("user-1", cfg.installationId);
+
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/whoami`, {
+      headers: { cookie: `cr_session=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ userId: "user-1", installationId: cfg.installationId });
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("chainreaction serve's wiring rejects a session signed with a different secret than the loaded OAuth config", async () => {
+  const cfg = await config();
+  const auth = oauthConfig();
+  const deps = realServerDeps(cfg, auth, neverCalledFetch());
+
+  const server = createServer(deps, 0);
+  try {
+    // Signed with a *different* secret — as it would be if serve's wiring
+    // used a placeholder OAuthConfig instead of the one loadOAuthConfig
+    // actually produced from the environment.
+    const wrongSessions = new SessionStore("a-completely-different-secret");
+    const cookie = await wrongSessions.createSession("user-1", cfg.installationId);
+
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/whoami`, {
+      headers: { cookie: `cr_session=${cookie}` },
+    });
+    expect(res.status).toBe(401);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("chainreaction serve's wiring exposes the hosted /api/repos surface (401 without a session, no network reached)", async () => {
+  const cfg = await config();
+  const auth = oauthConfig();
+  const deps = realServerDeps(cfg, auth, neverCalledFetch());
+
+  const server = createServer(deps, 0);
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/repos`);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  } finally {
+    server.stop(true);
+  }
 });

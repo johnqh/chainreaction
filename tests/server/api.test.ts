@@ -162,6 +162,7 @@ const ROUTES: { path: string; init?: RequestInit }[] = [
   { path: "/api/prs", init: { method: "POST", body: JSON.stringify({ entries: [] }) } },
   { path: "/api/merge", init: { method: "POST", body: JSON.stringify({ repo: "acme/x", pr: 1 }) } },
   { path: "/api/train", init: { method: "POST", body: JSON.stringify({ entries: [], prs: {} }) } },
+  { path: "/api/published", init: { method: "POST", body: JSON.stringify({ entries: [] }) } },
 ];
 
 for (const { path, init } of ROUTES) {
@@ -387,6 +388,45 @@ test("POST /api/merge rejects a malformed body", async () => {
   expect(res.status).toBe(400);
 });
 
+// --- Fix-round: 502 vs 503 must distinguish an ordinary merge failure from a
+// systemic one (a caller like the hosted web client, which treats a 502 here
+// as "this specific PR's merge was rejected", must never see that status for
+// a failure that has nothing to do with the named PR at all). ------------------
+
+test("POST /api/merge reports 503, not 502, when the fresh membership check itself fails (a systemic failure, not this PR's)", async () => {
+  const brokenGithub: GitHubApi = {
+    listRepos: async () => {
+      throw new Error("installation token exchange failed: bad credentials");
+    },
+    getManifest: async () => null,
+  };
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ github: brokenGithub, pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/design", pr: 55 }),
+  });
+  expect(res.status).toBe(503);
+  expect(await res.json()).toEqual({ error: "installation token exchange failed: bad credentials" });
+  // mergePr must never even be attempted once the membership check itself failed.
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/merge reports 502, not 503, when mergePr itself is reached and GitHub rejects it", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi({ mergeShouldFail: true });
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const res = await call("/api/merge", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ repo: "acme/design", pr: 55 }),
+  });
+  expect(res.status).toBe(502);
+  expect(prCalls).toEqual(["mergePr:acme/design:55"]);
+});
+
 // --- POST /api/train -------------------------------------------------------------
 
 test("POST /api/train runs the train to completion, merging bottom-up", async () => {
@@ -464,6 +504,70 @@ test("POST /api/train rejects a malformed body", async () => {
   const deps = baseDeps();
   const res = await call("/api/train", deps, session(), { method: "POST", body: JSON.stringify({ entries: [] }) });
   expect(res.status).toBe(400);
+});
+
+// --- POST /api/published ---------------------------------------------------------
+//
+// Exists so a manual "Refresh" in the web UI can ask the real question —
+// "is this genuinely published?" — instead of "has this merged?" (which is
+// what re-reading /api/graph's default-branch manifest would answer). See
+// handlePublished's own doc comment in src/server/api.ts for the race this
+// prevents.
+
+test("POST /api/published returns exactly the pkgs whose toVersion isResolvable reports true, and none of the rest", async () => {
+  const seen: { pkg: string; toVersion: string }[] = [];
+  const deps = baseDeps({
+    isResolvable: async (e) => {
+      seen.push({ pkg: e.pkg, toVersion: e.toVersion });
+      return e.pkg === "@acme/design"; // only this one is "published"
+    },
+  });
+
+  const entries = [
+    entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.2.0" }),
+    entry({ pkg: "@acme/components", repo: "acme/components", toVersion: "2.3.0" }),
+  ];
+  const res = await call("/api/published", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries }),
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ resolvable: ["@acme/design"] });
+  expect(seen).toEqual([
+    { pkg: "@acme/design", toVersion: "1.2.0" },
+    { pkg: "@acme/components", toVersion: "2.3.0" },
+  ]);
+});
+
+test("POST /api/published refuses to probe a repo outside this installation, and calls isResolvable for none of them", async () => {
+  let calls = 0;
+  const deps = baseDeps({ isResolvable: async () => { calls++; return true; } });
+
+  const entries = [
+    entry({ pkg: "@acme/design", repo: "acme/design" }),
+    entry({ pkg: "@evil/payload", repo: "attacker/payload" }),
+  ];
+  const res = await call("/api/published", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries }),
+  });
+  expect(res.status).toBe(403);
+  expect(calls).toBe(0);
+});
+
+test("POST /api/published rejects a malformed body", async () => {
+  const deps = baseDeps();
+  const res = await call("/api/published", deps, session(), { method: "POST", body: JSON.stringify({ entries: [] }) });
+  expect(res.status).toBe(400);
+});
+
+test("POST /api/published with no session is a flat 401", async () => {
+  const deps = baseDeps();
+  const res = await call("/api/published", deps, null, {
+    method: "POST",
+    body: JSON.stringify({ entries: [entry({ pkg: "@acme/design", repo: "acme/design" })] }),
+  });
+  expect(res.status).toBe(401);
 });
 
 // --- Fix-round: scopeFor/requiredChecksFor are looked up per installation ------
