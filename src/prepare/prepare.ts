@@ -32,8 +32,9 @@ async function assess(
   }
   if (requiredChecks.length === 0) {
     blockers.push(
-      `${full} has no required status check. Auto-merge needs an unsatisfied requirement to ` +
-        `wait on, so a repo with no CI cannot take part in a cascade.`,
+      `${full} has no required status check. A cascade needs some check to gate merging on — ` +
+        `whichever mechanism performs the merge, auto-merge or the control plane — so a repo ` +
+        `with no CI cannot take part in a cascade.`,
     );
   }
   if (caps.protection === "protected") {

@@ -77,6 +77,21 @@ test("plan without --all or --targets refuses", async () => {
   expect(d.lines.join("\n")).toMatch(/--all|--targets/);
 });
 
+test("the no-scope message describes --targets as acknowledgement, not filtering", async () => {
+  // --targets requires naming every affected package (assertScoped refuses a
+  // partial list) — it is not a way to select a subset. The help text used to
+  // say "name exactly which ones", which reads exactly like a filter and
+  // sends users toward an invocation the tool always refuses. This pins the
+  // corrected wording: it must describe --targets as needing to name every
+  // affected package, and --all as the way to accept the whole set without
+  // enumerating it.
+  const d = deps();
+  await runCli(["plan", "@acme/design"], d);
+  const out = d.lines.join("\n");
+  expect(out).toMatch(/every|whole|all of them/i);
+  expect(out).not.toMatch(/name exactly which ones/i);
+});
+
 test("plan with both --all and --targets refuses", async () => {
   const d = deps();
   expect(await runCli(["plan", "@acme/design", "--all", "--targets", "x"], d)).not.toBe(0);

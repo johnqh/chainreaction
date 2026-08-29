@@ -6,6 +6,7 @@ import { assessRepo, prepareRepo } from "../prepare/prepare";
 import { planCascade, type PreparedProvider } from "../plan/planCascade";
 import type { CliDeps } from "./main";
 import type { CliConfig } from "./config";
+import type { PrepareResult } from "../prepare/types";
 
 /**
  * Builds the real `CliDeps` `bin.ts` runs against, wired to one GitHub App
@@ -30,11 +31,23 @@ export function realDeps(config: CliConfig, fetchFn: typeof fetch = fetch): CliD
   // Read-only by construction: assessRepo never calls enableAutoMerge or
   // setProtection. This is the only place planCascade learns anything about
   // repo readiness, so plan can never mutate through it.
+  //
+  // Sequential on purpose, not an oversight: assessRepo -> probeRepo issues 3
+  // requests per repo (getRepo, then getProtection + hasFile in parallel).
+  // GitHub's secondary rate limits trigger on concurrency, not volume — a
+  // 60-package cascade run with Promise.all here would fire 180 concurrent
+  // requests and get 403'd. GitHubGraphSource.load() already takes one
+  // manifest at a time for the same reason (see its doc comment). Bounded
+  // concurrency would help throughput, but is only safe to add once
+  // retry/backoff exists upstream of it — without that, a 403 from a burst of
+  // concurrent requests is indistinguishable from a real failure and the
+  // whole plan aborts. Until then: a plain, serial loop.
   const prepared: PreparedProvider = async (repos) => {
-    const entries = await Promise.all(
-      repos.map(async (repo) => [repo, await assessRepo(adminApi, repo, config.requiredChecks)] as const),
-    );
-    return new Map(entries);
+    const result = new Map<string, PrepareResult>();
+    for (const repo of repos) {
+      result.set(repo, await assessRepo(adminApi, repo, config.requiredChecks));
+    }
+    return result;
   };
 
   return {

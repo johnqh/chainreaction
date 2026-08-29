@@ -25,9 +25,15 @@ export class GitHubGraphSource implements GraphSource {
   constructor(private api: GitHubApi, private scope: string) {}
 
   async load(): Promise<Map<string, RepoNode>> {
+    // Reset before the first await, not after: `load()` suspends at
+    // `listRepos()`, and a second overlapping `load()` call on this same
+    // instance would otherwise wipe the first call's in-progress entries out
+    // from under it. `planCascade` reads `skipped` only after `load()`
+    // resolves, so a clobbered array here would silently report an
+    // incomplete graph as complete.
+    this.skipped.length = 0;
     const repos = await this.api.listRepos();
     const graph = new Map<string, RepoNode>();
-    this.skipped.length = 0;
 
     for (const repo of repos) {
       const raw = await this.api.getManifest(repo.fullName);

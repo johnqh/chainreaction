@@ -71,8 +71,9 @@ function parseTargets(argv: string[]): { targets: string[] | "all" } | { error: 
   if (!hasAll && !hasTargets) {
     return {
       error:
-        "refusing to plan without an explicit scope. Pass --all to publish every affected " +
-        "package, or --targets a,b,c to name exactly which ones.",
+        "refusing to plan without an explicit scope. --targets does not filter the cascade — " +
+        "it must name every package the plan affects, or it is refused. Pass --all to accept " +
+        "the whole affected set without enumerating it, or --targets a,b,c naming all of them.",
     };
   }
   if (hasAll) return { targets: "all" };
