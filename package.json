@@ -9,6 +9,8 @@
     "chainreaction": "bun src/cli/bin.ts"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.11.15",
+    "@testing-library/react": "^16.3.3",
     "@types/bun": "^1.4.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
