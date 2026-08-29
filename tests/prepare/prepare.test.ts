@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mergeMechanismFor, prepareRepo } from "../../src/prepare/prepare";
+import { assessRepo, mergeMechanismFor, prepareRepo } from "../../src/prepare/prepare";
 import type { ProtectionProbe, RepoAdminApi, RepoMeta } from "../../src/prepare/adminApi";
 import type { RepoCapabilities } from "../../src/prepare/types";
 
@@ -46,6 +46,16 @@ test("prepare does not attempt protection when it is unavailable, and still succ
   expect(calls.some((c) => c.startsWith("setProtection"))).toBe(false);
   expect(res.ready).toBe(true);
   expect(res.mechanism).toBe("control-plane");
+});
+
+test("prepareRepo performs no mutation at all for a control-plane repo — it is about to be declared unusable", async () => {
+  const { a, calls } = api({
+    protection: { status: 403, message: "Upgrade to GitHub Pro or make this repository public to enable this feature." },
+    meta: { defaultBranch: "main", isPrivate: true, allowAutoMerge: false },
+  });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.mechanism).toBe("control-plane");
+  expect(calls).toEqual([]);
 });
 
 test("an already-protected repo is blocked and setProtection is never called", async () => {
@@ -107,4 +117,32 @@ test("enableAutoMerge is skipped when it is already on", async () => {
   const res = await prepareRepo(a, "acme/lib", ["ci"]);
   expect(calls).toEqual(["setProtection:ci"]);
   expect(res.ready).toBe(true);
+});
+
+// --- FIX 3: assessRepo is the read-only half prepareRepo is built on ---
+
+test("assessRepo performs no mutation, even for a repo that would otherwise be prepared", async () => {
+  const { a, calls } = api({ protection: { status: 404 } });
+  const res = await assessRepo(a, "acme/lib", ["ci"]);
+  expect(res).toMatchObject({ repo: "acme/lib", ready: true, mechanism: "auto-merge", blockers: [] });
+  expect(calls).toEqual([]);
+});
+
+test("assessRepo reports the same blockers as prepareRepo for a blocked repo", async () => {
+  const { a: assessApi } = api({ file: false });
+  const { a: prepareApi } = api({ file: false });
+  const assessed = await assessRepo(assessApi, "acme/lib", ["ci"]);
+  const prepared = await prepareRepo(prepareApi, "acme/lib", ["ci"]);
+  expect(assessed).toEqual(prepared);
+});
+
+test("assessRepo reports control-plane readiness without ever touching the repo", async () => {
+  const { a, calls } = api({
+    protection: { status: 403, message: "Upgrade to GitHub Pro or make this repository public to enable this feature." },
+    meta: { defaultBranch: "main", isPrivate: true, allowAutoMerge: false },
+  });
+  const res = await assessRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(true);
+  expect(res.mechanism).toBe("control-plane");
+  expect(calls).toEqual([]);
 });

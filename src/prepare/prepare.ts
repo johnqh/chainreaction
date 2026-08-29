@@ -8,12 +8,18 @@ export function mergeMechanismFor(caps: RepoCapabilities): MergeMechanism {
   return caps.protection === "unavailable" ? "control-plane" : "auto-merge";
 }
 
-export async function prepareRepo(
+interface Assessment {
+  caps: RepoCapabilities;
+  mechanism: MergeMechanism;
+  result: PrepareResult;
+}
+
+async function assess(
   api: RepoAdminApi,
   full: string,
   requiredChecks: string[],
-  workflowPath: string = DEFAULT_WORKFLOW_PATH,
-): Promise<PrepareResult> {
+  workflowPath: string,
+): Promise<Assessment> {
   const caps = await probeRepo(api, full, workflowPath);
   const mechanism = mergeMechanismFor(caps);
   const blockers: string[] = [];
@@ -45,7 +51,35 @@ export async function prepareRepo(
     );
   }
 
-  if (blockers.length === 0) {
+  return { caps, mechanism, result: { repo: full, ready: blockers.length === 0, mechanism, blockers } };
+}
+
+/** Probe a repo and compute its blockers. Performs no writes. */
+export async function assessRepo(
+  api: RepoAdminApi,
+  full: string,
+  requiredChecks: string[],
+  workflowPath: string = DEFAULT_WORKFLOW_PATH,
+): Promise<PrepareResult> {
+  const { result } = await assess(api, full, requiredChecks, workflowPath);
+  return result;
+}
+
+/** `assessRepo`, then apply the mutations it implies. */
+export async function prepareRepo(
+  api: RepoAdminApi,
+  full: string,
+  requiredChecks: string[],
+  workflowPath: string = DEFAULT_WORKFLOW_PATH,
+): Promise<PrepareResult> {
+  const { caps, mechanism, result } = await assess(api, full, requiredChecks, workflowPath);
+
+  // A control-plane repo is about to be reported as unable to take part in a
+  // cascade (see participationBlocker) — never mutate a repo you are about to
+  // declare unusable. Its `ready: true` here only means "the probe found no
+  // blocker", which mergeMechanismFor and participationBlocker both already
+  // know is not the same thing as "can take part today".
+  if (result.ready && mechanism !== "control-plane") {
     if (!caps.autoMergeEnabled) await api.enableAutoMerge(full);
     if (caps.protection === "unprotected") {
       // Status checks only, never reviews: an identity cannot approve its own PR,
@@ -54,5 +88,5 @@ export async function prepareRepo(
     }
   }
 
-  return { repo: full, ready: blockers.length === 0, mechanism, blockers };
+  return result;
 }

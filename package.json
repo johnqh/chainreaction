@@ -2,6 +2,12 @@
   "name": "chainreaction",
   "type": "module",
   "private": true,
+  "bin": {
+    "chainreaction": "./src/cli/bin.ts"
+  },
+  "scripts": {
+    "chainreaction": "bun src/cli/bin.ts"
+  },
   "devDependencies": {
     "@types/bun": "^1.4.0",
     "@types/react": "^19.2.18",
