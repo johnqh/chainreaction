@@ -35,7 +35,8 @@ export class GitHubGraphSource implements GraphSource {
 
       let pkg: { name?: string; version?: string;
                  dependencies?: Record<string, string>;
-                 peerDependencies?: Record<string, string> };
+                 peerDependencies?: Record<string, string>;
+                 devDependencies?: Record<string, string> };
       try {
         pkg = JSON.parse(raw);
       } catch (err) {
@@ -62,11 +63,16 @@ export class GitHubGraphSource implements GraphSource {
         .filter((d) => d.startsWith(this.scope))
         .sort();
 
+      const devDeps = Object.keys(pkg.devDependencies ?? {})
+        .filter((d) => d.startsWith(this.scope))
+        .sort();
+
       graph.set(pkg.name, {
         pkg: pkg.name,
         repo: repo.fullName,
         version: pkg.version ?? "0.0.0",
         deps,
+        devDeps,
       });
     }
     return graph;

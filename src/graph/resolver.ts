@@ -30,12 +30,17 @@ export function scanRepos(root: string): Map<string, RepoNode> {
       .filter((d) => d.startsWith(SCOPE))
       .sort();
 
+    const devDeps = Object.keys({ ...pkg.devDependencies })
+      .filter((d) => d.startsWith(SCOPE))
+      .sort();
+
     graph.set(pkg.name, {
       pkg: pkg.name,
       dir,
       repo: `${ORG}/${basename(dir)}`,
       version: pkg.version ?? "0.0.0",
       deps,
+      devDeps,
     });
   }
   return graph;
