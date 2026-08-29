@@ -211,3 +211,55 @@ test("stalls loudly when no open PR is recorded for a ready entry", async () => 
   expect(outcome.pkg).toBe("proj-a");
   expect(outcome.reason).toMatch(/no open pr/i);
 });
+
+test("stall reason for a never-ready entry names the specific unpublished in-chain dependency, not a published one", async () => {
+  const a = entry({ pkg: "proj-a" });
+  const b = entry({ pkg: "proj-b", depBumps: { "proj-c": "^1.0.1" } });
+  const c = entry({
+    pkg: "proj-c",
+    depBumps: { "proj-a": "^1.0.1", "proj-b": "^1.0.1" },
+  });
+  // `b` and `c` depend on each other — a genuine unresolvable cycle. Once
+  // `a` publishes, both remain permanently blocked: `b` because `proj-c`
+  // never publishes, `c` because `proj-b` never publishes. `c` is where the
+  // interesting assertion lives — it has TWO in-chain dependencies, and only
+  // one of them (`proj-a`) actually publishes. `c` is placed right after `a`
+  // in the array so it (not `b`) is the entry the stall names.
+  const entries = [a, c, b];
+  const prs = new Map([
+    [a.repo, 901],
+    [b.repo, 902],
+    [c.repo, 903],
+  ]);
+  const { deps } = makeDeps({});
+
+  const outcome = await runTrain(entries, prs, deps);
+
+  expect(outcome.status).toBe("stalled");
+  if (outcome.status !== "stalled") throw new Error("expected stalled");
+  expect(outcome.pkg).toBe("proj-c");
+  expect(outcome.reason).toContain("proj-b");
+  expect(outcome.reason).not.toContain("proj-a");
+});
+
+test("sequencing follows observed publish state, not the level field, even when level contradicts dependency order", async () => {
+  // `proj-a` is the leaf (no deps) but is deliberately mismarked with the
+  // *highest* level; `proj-b` is the root of this two-entry chain but is
+  // mismarked with the *lowest* level. If runTrain ever started sequencing
+  // off `entry.level` instead of observed `published` state, this would
+  // merge `proj-b` before `proj-a` and fail.
+  const a = entry({ pkg: "proj-a", level: 2 });
+  const b = entry({ pkg: "proj-b", depBumps: { "proj-a": "^1.0.1" }, level: 0 });
+  const entries = [a, b];
+  const prs = new Map([
+    [a.repo, 1001],
+    [b.repo, 1002],
+  ]);
+  const { deps } = makeDeps({});
+
+  const outcome = await runTrain(entries, prs, deps);
+
+  expect(outcome.status).toBe("success");
+  if (outcome.status !== "success") throw new Error("expected success");
+  expect(outcome.merged.map((m) => m.pkg)).toEqual(["proj-a", "proj-b"]);
+});

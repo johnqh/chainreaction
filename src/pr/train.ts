@@ -70,14 +70,34 @@ export async function runTrain(
 
     if (!next) {
       const stuck = entries.find((e) => pending.has(e.pkg));
-      const pkg = stuck?.pkg ?? "<unknown>";
-      const repo = stuck?.repo ?? "<unknown>";
+      if (!stuck) {
+        // Unreachable: pending.size > 0 guarantees some entry is pending.
+        return {
+          status: "stalled",
+          merged,
+          pkg: "<unknown>",
+          repo: "<unknown>",
+          reason: "internal error: no pending entry found despite a non-empty pending set",
+        };
+      }
+      // Same intersection classifyPr uses internally — in-chain deps of
+      // `stuck` that have not yet published — so the reason names exactly
+      // what `stuck` is waiting on, not just that it is stuck.
+      const inChain = new Set(entries.map((e) => e.pkg));
+      const waitingFor = Object.keys(stuck.depBumps).filter(
+        (dep) => inChain.has(dep) && !published.has(dep),
+      );
+      const reason =
+        waitingFor.length > 0
+          ? `${stuck.pkg} is blocked — waiting for upstream package(s) to publish: ${waitingFor.join(", ")}`
+          : `${stuck.pkg} never became ready to merge, but no unpublished in-chain dependency could ` +
+            `be identified — this indicates a readiness-tracking bug, not a normal stall`;
       return {
         status: "stalled",
         merged,
-        pkg,
-        repo,
-        reason: `${pkg} never became ready to merge — its upstream dependency never published`,
+        pkg: stuck.pkg,
+        repo: stuck.repo,
+        reason,
       };
     }
 
