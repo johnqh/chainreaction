@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { dependencyClosure, dependencyLevels } from "../../src/graph/closure";
+import { topoLevels } from "../../src/graph/resolver";
 import type { RepoNode } from "../../src/graph/types";
 
 const node = (pkg: string, deps: string[], devDeps: string[] = []): RepoNode => ({
@@ -86,4 +87,39 @@ test("throws on a dependency cycle rather than looping", () => {
   }).toThrow(/cycle/i);
   expect(message).toContain("a");
   expect(message).toContain("b");
+});
+
+// devDeps is optional on RepoNode, and a real graph built from a package.json
+// with no devDependencies block omits the key entirely rather than recording an
+// empty array. Every other fixture here goes through node(), whose default
+// `devDeps: string[] = []` always writes the key — so without this test the
+// `?? []` fallback in both functions is never actually exercised. Mirrors
+// closure.test.ts's "a node with no devDeps recorded is handled".
+test("a node with no devDeps recorded is handled", () => {
+  const g = new Map<string, RepoNode>([
+    ["a", { pkg: "a", repo: "acme/a", version: "1.0.0", deps: [] }],
+  ]);
+  expect(() => dependencyClosure(g, "a")).not.toThrow();
+  expect(() => dependencyLevels(g, new Set(["a"]))).not.toThrow();
+});
+
+// dependencyLevels deliberately duplicates topoLevels' loop, differing only in
+// which edges it follows: topoLevels must ignore devDeps so publish order is
+// never gated on one, while dependencyLevels must include them. Strip the only
+// intended difference — give every node an empty devDeps — and the two must
+// agree exactly. Nothing else would catch the sibling silently drifting from
+// its twin.
+test("with no devDeps edges, dependencyLevels agrees with topoLevels", () => {
+  // Inserted in deliberately non-alphabetical order: both functions sort each
+  // level, so a drift that dropped that sort would surface here as insertion
+  // order rather than being masked by an already-sorted fixture.
+  const graph = new Map<string, RepoNode>([
+    ["d", node("d", ["b", "c"])],
+    ["c", node("c", ["a"])],
+    ["b", node("b", ["a"])],
+    ["a", node("a", [])],
+  ]);
+  // Subset iteration order, not graph order, drives each level's ordering.
+  const subset = new Set(["d", "c", "b", "a"]);
+  expect(dependencyLevels(graph, subset)).toEqual(topoLevels(graph, subset));
 });
