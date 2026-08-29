@@ -18,8 +18,11 @@ function stub(handler: (url: string, init?: RequestInit) => Response) {
 test("defaultBranchSha resolves the tip sha of the given branch via the git refs endpoint", async () => {
   const { fn, calls } = stub(() => new Response(JSON.stringify({ object: { sha: "abc123" } })));
   const api = new InstallationPrApi(token, 1, fn);
-  expect(await api.defaultBranchSha("acme/lib", "main")).toBe("abc123");
-  expect(calls[0]!.url).toContain("/repos/acme/lib/git/ref/heads/main");
+  // Deliberately not "main": a hardcoded "main" fallback would still return
+  // "abc123" here (this stub answers every URL the same way) but would
+  // request the wrong ref, which the exact URL assertion below catches.
+  expect(await api.defaultBranchSha("acme/lib", "trunk")).toBe("abc123");
+  expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/lib/git/ref/heads/trunk");
 });
 
 test("defaultBranchSha rejects a response with no usable sha", async () => {
@@ -40,7 +43,7 @@ test("createBranch POSTs a new ref pointing at fromSha", async () => {
   const { fn, calls } = stub(() => new Response(JSON.stringify({ ref: "refs/heads/cr/update" }), { status: 201 }));
   const api = new InstallationPrApi(token, 1, fn);
   await api.createBranch("acme/lib", "cr/update", "deadbeef");
-  expect(calls[0]!.url).toContain("/repos/acme/lib/git/refs");
+  expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/lib/git/refs");
   expect(calls[0]!.init!.method).toBe("POST");
   const body = JSON.parse(String(calls[0]!.init!.body));
   expect(body).toEqual({ ref: "refs/heads/cr/update", sha: "deadbeef" });
@@ -83,7 +86,7 @@ test("putFile reads the current blob sha immediately before writing, and sends e
 
   expect(calls.length).toBe(2);
   expect(calls[0]!.init?.method ?? "GET").toBe("GET");
-  expect(calls[0]!.url).toContain("ref=cr%2Fupdate");
+  expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/lib/contents/package.json?ref=cr%2Fupdate");
 
   expect(calls[1]!.init!.method).toBe("PUT");
   const body = JSON.parse(String(calls[1]!.init!.body));
@@ -125,11 +128,14 @@ test("putFile throws when the write itself is rejected — a failed write must n
 test("openPr POSTs title/head/base/body and returns the PR number", async () => {
   const { fn, calls } = stub(() => new Response(JSON.stringify({ number: 42 }), { status: 201 }));
   const api = new InstallationPrApi(token, 1, fn);
-  const pr = await api.openPr("acme/lib", "cr/update", "main", "chore: bump", "body text");
+  // base is deliberately not "main": if the implementation ever regressed to
+  // a hardcoded "--base main"-style default, this would still equal "main"
+  // by coincidence and the bug would slip through.
+  const pr = await api.openPr("acme/lib", "cr/update", "trunk", "chore: bump", "body text");
   expect(pr).toBe(42);
-  expect(calls[0]!.url).toContain("/repos/acme/lib/pulls");
+  expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/lib/pulls");
   const body = JSON.parse(String(calls[0]!.init!.body));
-  expect(body).toEqual({ title: "chore: bump", head: "cr/update", base: "main", body: "body text" });
+  expect(body).toEqual({ title: "chore: bump", head: "cr/update", base: "trunk", body: "body text" });
 });
 
 test("openPr throws when GitHub rejects opening the PR", async () => {
@@ -150,7 +156,7 @@ test("mergePr PUTs a squash merge", async () => {
   const { fn, calls } = stub(() => new Response(JSON.stringify({ merged: true, sha: "x" })));
   const api = new InstallationPrApi(token, 1, fn);
   await api.mergePr("acme/lib", 7);
-  expect(calls[0]!.url).toContain("/repos/acme/lib/pulls/7/merge");
+  expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/lib/pulls/7/merge");
   expect(calls[0]!.init!.method).toBe("PUT");
   expect(JSON.parse(String(calls[0]!.init!.body))).toEqual({ merge_method: "squash" });
 });
@@ -191,6 +197,15 @@ test("prState throws on a non-ok response", async () => {
   const { fn } = stub(() => new Response("{}", { status: 500 }));
   const api = new InstallationPrApi(token, 1, fn);
   await expect(api.prState("acme/lib", 7)).rejects.toThrow(/500/);
+});
+
+test("prState throws when the response has no usable state, instead of yielding undefined", async () => {
+  // A response missing `state` must never resolve to `undefined` — the
+  // poller's ternary would otherwise treat that as neither MERGED nor
+  // CLOSED and quietly report "ci-running" forever.
+  const { fn } = stub(() => new Response(JSON.stringify({ merged: false })));
+  const api = new InstallationPrApi(token, 1, fn);
+  await expect(api.prState("acme/lib", 7)).rejects.toThrow(/state/);
 });
 
 // --- no token leaks ---
@@ -261,13 +276,16 @@ test("GhClient.mergePr issues a real (non-auto) squash merge", async () => {
   expect(mergeCall).not.toContain("--auto");
 });
 
-test("GhClient.defaultBranchSha reads the tip sha via gh api", async () => {
+test("GhClient.defaultBranchSha reads the tip sha of the given branch via gh api", async () => {
+  // Deliberately not "main": a hardcoded "main" fallback would build the
+  // exact same args array as long as the caller happened to also ask for
+  // main, which is precisely the shape of bug this test exists to catch.
   const exec: Exec = async (args) => {
-    expect(args).toEqual(["api", "repos/acme/lib/git/ref/heads/main", "--jq", ".object.sha"]);
+    expect(args).toEqual(["api", "repos/acme/lib/git/ref/heads/trunk", "--jq", ".object.sha"]);
     return "tip-sha\n";
   };
   const gh: PrApi = new GhClient(exec);
-  expect(await gh.defaultBranchSha("acme/lib", "main")).toBe("tip-sha");
+  expect(await gh.defaultBranchSha("acme/lib", "trunk")).toBe("tip-sha");
 });
 
 test("GhClient.createBranch POSTs a new ref via gh api", async () => {
@@ -301,12 +319,18 @@ test("GhClient.putFile reads the current blob sha immediately before writing, an
     return "";
   };
   const gh: PrApi = new GhClient(exec);
+  // branch is "cr/update", not "main" — pinned exactly below so a
+  // regression that reads the sha from a hardcoded branch (e.g. "main")
+  // instead of the actual target branch is caught, rather than merely
+  // asserting "some -f flag was passed", which is true of both.
   await gh.putFile("acme/lib", "cr/update", "package.json", '{"v":1}', "chore: bump");
 
   expect(calls.length).toBe(2);
   const getCall = calls[0]!;
-  expect(getCall[0]).toBe("api");
-  expect(getCall).toContain("-f");
+  expect(getCall).toEqual([
+    "api", "repos/acme/lib/contents/package.json", "-X", "GET",
+    "-f", "ref=cr/update", "--jq", ".sha",
+  ]);
 
   const putCall = calls[1]!;
   expect(putCall).toContain("-X");
@@ -352,3 +376,12 @@ test("GhClient.putFile throws when the write itself fails, rather than swallowin
 // leak into a message it constructs, so the "no token in errors" guarantee
 // is exercised on InstallationPrApi above, which is the class that actually
 // carries one (via `TokenProvider`).
+
+test("GhClient.prState throws when the gh response has no usable state, instead of returning undefined", async () => {
+  // Same regression as InstallationPrApi above: pollOnce's ternary would
+  // otherwise treat an undefined state as neither MERGED nor CLOSED and
+  // silently report a broken poll as "ci-running" forever.
+  const exec: Exec = async () => JSON.stringify({ url: "https://github.com/acme/lib/pull/7" });
+  const gh: PrApi = new GhClient(exec);
+  await expect(gh.prState("acme/lib", 7)).rejects.toThrow(/state/);
+});

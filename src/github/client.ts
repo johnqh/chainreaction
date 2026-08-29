@@ -95,6 +95,14 @@ export class GhClient implements PrApi {
     const out = await this.exec([
       "pr", "view", String(pr), "-R", repo, "--json", "state",
     ]);
-    return JSON.parse(out).state;
+    const parsed = JSON.parse(out) as Record<string, unknown>;
+    const state = parsed["state"];
+    // A response with no usable state must never resolve to `undefined`:
+    // `pollOnce` would then fall through its ternary to "ci-running",
+    // reporting a broken poll as a perfectly healthy one forever.
+    if (typeof state !== "string" || state.length === 0) {
+      throw new Error(`prState ${repo}#${pr}: gh response has no usable state`);
+    }
+    return state;
   }
 }
