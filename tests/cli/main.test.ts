@@ -131,3 +131,35 @@ test("an unknown command exits non-zero with usage", async () => {
   expect(await runCli(["frobnicate"], d)).not.toBe(0);
   expect(d.lines.join("\n")).toMatch(/usage/i);
 });
+
+// --- serve -----------------------------------------------------------------
+
+test("serve calls deps.serve() exactly once and returns whatever it resolves to", async () => {
+  let calls = 0;
+  const d = deps({
+    serve: async () => {
+      calls += 1;
+      return 0;
+    },
+  });
+  expect(await runCli(["serve"], d)).toBe(0);
+  expect(calls).toBe(1);
+});
+
+test("serve exits non-zero, printing the message, when deps.serve is not wired", async () => {
+  const d = deps(); // no `serve` override — CliDeps.serve stays undefined
+  const code = await runCli(["serve"], d);
+  expect(code).not.toBe(0);
+  expect(d.lines.join("\n")).toMatch(/serve is not available/);
+});
+
+test("a thrown construction error from deps.serve (e.g. missing OAuth config) is reported cleanly and exits non-zero", async () => {
+  const d = deps({
+    serve: async () => {
+      throw new Error("CR_OAUTH_CLIENT_ID is required — set it to the GitHub OAuth App's client ID.");
+    },
+  });
+  const code = await runCli(["serve"], d);
+  expect(code).not.toBe(0);
+  expect(d.lines.join("\n")).toContain("CR_OAUTH_CLIENT_ID is required");
+});

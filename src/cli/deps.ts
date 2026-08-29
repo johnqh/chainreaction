@@ -4,8 +4,11 @@ import { InstallationRepoAdminApi } from "../prepare/installationAdminApi";
 import { GitHubGraphSource } from "../graph/githubSource";
 import { assessRepo, prepareRepo } from "../prepare/prepare";
 import { planCascade, type PreparedProvider } from "../plan/planCascade";
+import { createInstallationApiFactory, type ApiDeps } from "../server/api";
+import type { ServerDeps } from "../server/index";
+import { Cascade } from "../supervisor/state";
 import type { CliDeps } from "./main";
-import type { CliConfig } from "./config";
+import type { CliConfig, OAuthConfig } from "./config";
 import type { PrepareResult } from "../prepare/types";
 
 /**
@@ -56,5 +59,53 @@ export function realDeps(config: CliConfig, fetchFn: typeof fetch = fetch): CliD
     log: console.log,
     prepare: (repo) => prepareRepo(adminApi, repo, config.requiredChecks),
     plan: (changed, targets) => planCascade(source, changed, targets, prepared),
+  };
+}
+
+/**
+ * Builds the hosted API's `ApiDeps` (see `src/server/api.ts`) from the same
+ * `CliConfig` `realDeps` above uses — reusing `createInstallationApiFactory`
+ * rather than hand-assembling a second `TokenStore`/`Installation*Api` trio,
+ * so the hosted app and the CLI share exactly one path from App credentials
+ * to installation-scoped APIs.
+ *
+ * `scopeFor`/`requiredChecksFor` return `config`'s single configured value
+ * for every installation id they're called with — correct for a deployment
+ * serving one GitHub App installation today. Their signature already
+ * accepts an installation id because `ApiDeps` is shaped for a server that
+ * may one day serve many; nothing here forecloses that.
+ */
+export function realApiDeps(config: CliConfig, fetchFn: typeof fetch = fetch): ApiDeps {
+  const creds: AppCredentials = { appId: config.appId, privateKeyPem: config.privateKeyPem };
+  return {
+    apisFor: createInstallationApiFactory(creds, fetchFn),
+    scopeFor: () => config.scope,
+    requiredChecksFor: () => config.requiredChecks,
+    fetchFn,
+  };
+}
+
+/**
+ * Builds the `ServerDeps` `chainreaction serve` starts `createServer` with:
+ * the real hosted API (`realApiDeps` above) and the real OAuth login config
+ * the caller loaded via `loadOAuthConfig`. `auth` is never defaulted or
+ * substituted here — it is exactly the `OAuthConfig` the caller passes in,
+ * so a caller that forgot to load it gets a compile error, not a server
+ * quietly running with placeholder credentials.
+ *
+ * `cascade`/`entries`/`onApprove` wire the legacy SSE-driven supervisor
+ * screen `src/server/index.ts` still carries for backward compatibility.
+ * Nothing in this task gives it a client, so it is wired to an already-
+ * empty, inert `Cascade` rather than inventing a settings/state store this
+ * task doesn't call for.
+ */
+export function realServerDeps(config: CliConfig, auth: OAuthConfig, fetchFn: typeof fetch = fetch): ServerDeps {
+  return {
+    cascade: new Cascade([], 0),
+    entries: [],
+    onApprove: () => {},
+    auth,
+    fetchFn,
+    api: realApiDeps(config, fetchFn),
   };
 }
