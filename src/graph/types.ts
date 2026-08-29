@@ -4,6 +4,8 @@ export interface RepoNode {
   repo: string;
   version: string;
   deps: string[];
+  /** devDependencies within scope. Not part of the publish graph — see src/graph/closure.ts. */
+  devDeps?: string[];
 }
 
 export interface ChangesetEntry {
