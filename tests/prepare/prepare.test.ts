@@ -6,15 +6,22 @@ import type { RepoCapabilities } from "../../src/prepare/types";
 const caps = (over: Partial<RepoCapabilities> = {}): RepoCapabilities => ({
   repo: "acme/lib", defaultBranch: "main", isPrivate: false,
   protection: "unprotected", requiresReviews: false, autoMergeEnabled: false,
-  hasValidationWorkflow: true, ...over,
+  hasValidationWorkflow: true, observedChecks: [], ...over,
 });
 
-function api(over: Partial<{ meta: RepoMeta; protection: ProtectionProbe; file: boolean }> = {}) {
+function api(
+  over: Partial<{ meta: RepoMeta; protection: ProtectionProbe; file: boolean; checkRuns: string[] }> = {},
+) {
   const calls: string[] = [];
+  // Defaults to observing "ci" — the check name every test below that expects
+  // readiness passes as its requiredChecks — so tests unrelated to check
+  // verification don't have to know it exists. Tests for the new blocker
+  // override `checkRuns` explicitly.
   const a: RepoAdminApi = {
     getRepo: async () => over.meta ?? { defaultBranch: "main", isPrivate: false, allowAutoMerge: false },
     getProtection: async () => over.protection ?? { status: 404 },
     hasFile: async () => over.file ?? true,
+    listCheckRuns: async () => over.checkRuns ?? ["ci"],
     setProtection: async (_f, _b, contexts) => { calls.push(`setProtection:${contexts.join("+")}`); },
     enableAutoMerge: async () => { calls.push("enableAutoMerge"); },
   };
@@ -144,5 +151,55 @@ test("assessRepo reports control-plane readiness without ever touching the repo"
   const res = await assessRepo(a, "acme/lib", ["ci"]);
   expect(res.ready).toBe(true);
   expect(res.mechanism).toBe("control-plane");
+  expect(calls).toEqual([]);
+});
+
+// --- FIX: a required check that has never been observed on the default
+// branch blocks readiness. This is the guard against the exact failure mode
+// this fix exists for: a typo (or a stale name) in CR_REQUIRED_CHECKS makes
+// Prepare succeed, branch protection then requires a check that never runs,
+// and every PR to the repo — the customer's own included — silently becomes
+// unmergeable, with nothing telling anyone why. ---
+
+test("a required check GitHub has never reported on the default branch blocks readiness and names it", async () => {
+  const { a, calls } = api({ checkRuns: ["build", "test"] });
+  const res = await prepareRepo(a, "acme/lib", ["cy"]); // typo for "ci"
+  expect(res.ready).toBe(false);
+  expect(res.blockers.join(" ")).toMatch(/never reported a check named "cy"/);
+  expect(calls).toEqual([]);
+});
+
+test("the blocker lists the checks that were actually observed, so the fix is obvious", async () => {
+  const { a } = api({ checkRuns: ["build", "test"] });
+  const res = await prepareRepo(a, "acme/lib", ["cy"]);
+  expect(res.blockers.join(" ")).toMatch(/build/);
+  expect(res.blockers.join(" ")).toMatch(/test/);
+});
+
+test("the blocker says so explicitly when nothing at all has been observed", async () => {
+  const { a } = api({ checkRuns: [] });
+  const res = await prepareRepo(a, "acme/lib", ["ci"]);
+  expect(res.ready).toBe(false);
+  expect(res.blockers.join(" ")).toMatch(/No checks have been observed/);
+});
+
+test("a required check that has been observed does not block, even alongside others that have not", async () => {
+  const { a } = api({ checkRuns: ["ci"] });
+  const res = await prepareRepo(a, "acme/lib", ["ci", "also-missing"]);
+  expect(res.ready).toBe(false);
+  expect(res.blockers.join(" ")).toMatch(/"also-missing"/);
+  expect(res.blockers.join(" ")).not.toMatch(/"ci"/);
+});
+
+test("all required checks observed on the default branch is not itself a blocker", async () => {
+  const { a } = api({ checkRuns: ["ci", "build"] });
+  const res = await prepareRepo(a, "acme/lib", ["ci", "build"]);
+  expect(res.ready).toBe(true);
+  expect(res.blockers).toEqual([]);
+});
+
+test("prepareRepo never mutates a repo whose required check has never been observed", async () => {
+  const { a, calls } = api({ checkRuns: [] });
+  await prepareRepo(a, "acme/lib", ["ci"]);
   expect(calls).toEqual([]);
 });

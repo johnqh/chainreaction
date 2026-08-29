@@ -2,17 +2,17 @@ import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { YAML } from "bun";
-import { DEFAULT_REQUIRED_CHECK, DEFAULT_WORKFLOW_PATH } from "../../src/prepare/probe";
+import { DEFAULT_WORKFLOW_PATH } from "../../src/prepare/probe";
 
 /**
- * `DEFAULT_REQUIRED_CHECK` is set as a *required* status check on the
- * customer's default branch by Prepare. If this template's job name ever
- * drifts from that constant, the check GitHub reports never matches the one
- * branch protection is waiting on, and every PR to that repo — the
- * customer's as much as ChainReaction's — becomes permanently unmergeable.
- * A comment saying "keep these in sync" is not a mechanism; parsing the
- * template and asserting against the constant is the only thing that
- * actually holds them together.
+ * The job name in this template is NOT load-bearing: `ActionsValidator`
+ * finds the workflow to dispatch by file path, and matches the run it
+ * dispatched by cascade id embedded in the run's display title — never by
+ * job name. What actually matters, and what this file asserts, is that the
+ * template keeps triggering on `workflow_dispatch` with the `cascade_id`
+ * input the dispatcher supplies, keeps requesting exactly the permissions it
+ * needs (`id-token: write` to mint the OIDC token, `contents: read` and
+ * nothing more), and never leaks the claimed token into a log or output.
  */
 
 const TEMPLATE_PATH = join(import.meta.dir, "../../docs/chainreaction-validate.yml");
@@ -38,19 +38,25 @@ test("the template parses as YAML", () => {
   expect(doc.jobs).toBeDefined();
 });
 
-test("the job's id equals DEFAULT_REQUIRED_CHECK", () => {
-  const { key } = theJob();
-  expect(key).toBe(DEFAULT_REQUIRED_CHECK);
-});
+test("still triggers on workflow_dispatch with a required cascade_id string input, requests only " +
+  "id-token: write plus contents: read, and never echoes the claim response — the properties " +
+  "ActionsValidator and the claim step actually depend on, unlike the job name", () => {
+  const dispatch = doc.on?.["workflow_dispatch"] as
+    | { inputs?: Record<string, { required?: boolean; type?: string }> }
+    | undefined;
+  expect(dispatch?.inputs?.["cascade_id"]?.required).toBe(true);
+  expect(dispatch?.inputs?.["cascade_id"]?.type).toBe("string");
 
-test("the job's display name equals DEFAULT_REQUIRED_CHECK", () => {
-  // The name customers see as the check on their PRs is the job's `name:`
-  // field when present (falling back to the job id otherwise) — GitHub does
-  // not prefix it with the workflow's own top-level `name:`. Asserting this
-  // explicitly, rather than trusting the job id alone, is what would catch
-  // someone adding a `name:` override later that disagrees with the id.
-  const { key, job } = theJob();
-  expect(job.name ?? key).toBe(DEFAULT_REQUIRED_CHECK);
+  expect(doc.permissions).toEqual({ "id-token": "write", contents: "read" });
+
+  expect(raw).not.toMatch(/GITHUB_OUTPUT/);
+  expect(raw).not.toMatch(/::set-output::/);
+  const echoLinesWithToken = raw
+    .split("\n")
+    .filter((line) => /\becho\b/.test(line) && /\$\{?token\b/.test(line));
+  for (const line of echoLinesWithToken) {
+    expect(line).toContain("::add-mask::");
+  }
 });
 
 test("DEFAULT_WORKFLOW_PATH still points at .github/workflows/<this file's name>", () => {

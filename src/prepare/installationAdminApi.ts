@@ -1,5 +1,5 @@
 import type { RepoAdminApi, RepoMeta, ProtectionProbe } from "./adminApi";
-import type { TokenProvider } from "../github/installationApi";
+import { parseNextLink, type TokenProvider } from "../github/installationApi";
 
 const API_ROOT = "https://api.github.com";
 
@@ -63,6 +63,38 @@ export class InstallationRepoAdminApi implements RepoAdminApi {
     if (res.status === 404) return false;
     // A 500 quietly becoming "absent" would block a ready repo for the wrong reason.
     throw new Error(`hasFile ${full}:${path} failed: ${res.status}`);
+  }
+
+  /**
+   * Walks every page of GET /repos/{full}/commits/{ref}/check-runs and
+   * returns the distinct check-run names seen. Follows the `Link` header
+   * (via `parseNextLink`, the same helper `InstallationGitHubApi.listRepos`
+   * and `ActionsValidator.findRun` use) rather than trusting `total_count`,
+   * for the same reason those callers do: a busy repo can have far more
+   * than one page of check-runs on its default branch's tip commit.
+   */
+  async listCheckRuns(full: string, ref: string): Promise<string[]> {
+    const names = new Set<string>();
+    let url: string | null = `${API_ROOT}/repos/${full}/commits/${ref}/check-runs?per_page=100`;
+
+    while (url) {
+      const res: Response = await this.request(url);
+      if (!res.ok) throw new Error(`listCheckRuns ${full}@${ref} failed: ${res.status}`);
+      const body = (await res.json()) as Record<string, unknown>;
+      const checkRuns = body["check_runs"];
+      if (!Array.isArray(checkRuns)) {
+        throw new Error(`listCheckRuns ${full}@${ref}: response has no check_runs array`);
+      }
+      for (const raw of checkRuns) {
+        const name = (raw as Record<string, unknown> | null)?.["name"];
+        if (typeof name !== "string" || name.length === 0) {
+          throw new Error(`listCheckRuns ${full}@${ref}: a check run has no usable name`);
+        }
+        names.add(name);
+      }
+      url = parseNextLink(res.headers.get("link"));
+    }
+    return [...names];
   }
 
   async setProtection(full: string, branch: string, contexts: string[]): Promise<void> {

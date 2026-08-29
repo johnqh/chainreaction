@@ -10,11 +10,18 @@
 # README for what to configure and why ChainReaction cannot add this file
 # for you.
 #
-# The job name below MUST stay exactly "chainreaction-validate". It is the
-# required status check ChainReaction sets on this repository's default
-# branch during Prepare. Rename it and branch protection waits forever on a
-# check that never arrives — every pull request to this repository, not only
-# ChainReaction's, becomes unmergeable.
+# This file's PATH — .github/workflows/chainreaction-validate.yml — is what
+# Prepare verifies exists on your default branch. That path must not change.
+#
+# The job name below (chainreaction-validate) is cosmetic: it is what a human
+# reads in the Actions log and in the run list, nothing more. It is NOT a
+# required status check — this workflow only ever runs via workflow_dispatch,
+# and a required status check is evaluated against a pull request's head
+# commit, which a dispatched run never attaches to. The status check your
+# branch protection actually requires is your own CI's existing check (e.g.
+# "build", "test", "ci") — set that via CR_REQUIRED_CHECKS, never the name of
+# this job. Rename this job freely; it changes nothing about how Prepare or
+# the cascade validates this repo.
 name: ChainReaction Validate
 
 on:

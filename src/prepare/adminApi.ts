@@ -28,6 +28,15 @@ export interface RepoAdminApi {
    */
   getProtection(full: string, branch: string): Promise<ProtectionProbe>;
   hasFile(full: string, path: string): Promise<boolean>;
+  /**
+   * Distinct names of every check-run GitHub has reported against `ref`'s
+   * tip commit (typically the default branch). This is how Prepare tells
+   * a required check that is merely misspelled or has never run apart from
+   * one that genuinely runs on every PR — a typo here means branch
+   * protection will require a check that never appears, silently making
+   * every pull request to the repo unmergeable.
+   */
+  listCheckRuns(full: string, ref: string): Promise<string[]>;
   setProtection(full: string, branch: string, contexts: string[]): Promise<void>;
   enableAutoMerge(full: string): Promise<void>;
 }

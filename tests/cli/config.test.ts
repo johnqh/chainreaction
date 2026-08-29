@@ -1,12 +1,12 @@
 import { test, expect } from "bun:test";
 import { loadConfig } from "../../src/cli/config";
-import { DEFAULT_REQUIRED_CHECK } from "../../src/prepare/probe";
 
 const BASE_ENV: Record<string, string | undefined> = {
   CR_APP_ID: "12345",
   CR_PRIVATE_KEY_PATH: "/fake/app.pem",
   CR_INSTALLATION_ID: "987",
   CR_SCOPE: "@acme/",
+  CR_REQUIRED_CHECKS: "ci",
 };
 
 const FAKE_KEY = "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n";
@@ -19,11 +19,11 @@ test("a valid environment produces the expected config object", () => {
     privateKeyPem: FAKE_KEY,
     installationId: 987,
     scope: "@acme/",
-    requiredChecks: [DEFAULT_REQUIRED_CHECK],
+    requiredChecks: ["ci"],
   });
 });
 
-for (const name of ["CR_APP_ID", "CR_PRIVATE_KEY_PATH", "CR_INSTALLATION_ID", "CR_SCOPE"]) {
+for (const name of ["CR_APP_ID", "CR_PRIVATE_KEY_PATH", "CR_INSTALLATION_ID", "CR_SCOPE", "CR_REQUIRED_CHECKS"]) {
   test(`missing ${name} produces an error naming it`, () => {
     const env = { ...BASE_ENV };
     delete env[name];
@@ -65,9 +65,15 @@ test("CR_REQUIRED_CHECKS splits on commas and trims each entry", () => {
   expect(config.requiredChecks).toEqual(["ci", "build"]);
 });
 
-test("CR_REQUIRED_CHECKS absent defaults to [DEFAULT_REQUIRED_CHECK]", () => {
-  const config = loadConfig(BASE_ENV, readFile);
-  expect(config.requiredChecks).toEqual([DEFAULT_REQUIRED_CHECK]);
+test("CR_REQUIRED_CHECKS absent is a config error naming it — there is no default", () => {
+  // `chainreaction-validate` (the pre-flight check) is never a valid default:
+  // it only runs via workflow_dispatch and can never attach to a pull
+  // request's head commit, so silently defaulting to it would set a required
+  // status check that never appears and make every PR unmergeable. The only
+  // correct value is the repo's own CI check, which only the operator knows.
+  const env = { ...BASE_ENV };
+  delete env["CR_REQUIRED_CHECKS"];
+  expect(() => loadConfig(env, readFile)).toThrow(/CR_REQUIRED_CHECKS/);
 });
 
 test("CR_REQUIRED_CHECKS that filters down to nothing is a config error, not an empty list", () => {
@@ -85,12 +91,15 @@ test("CR_REQUIRED_CHECKS of only whitespace-separated commas is also a config er
   expect(() => loadConfig(env, readFile)).toThrow(/CR_REQUIRED_CHECKS/);
 });
 
-test("an absent CR_REQUIRED_CHECKS and a malformed one remain distinguishable outcomes", () => {
-  // Absent -> the documented default. Malformed -> a thrown config error.
-  // These must never collapse to the same "empty list" result.
-  const absent = loadConfig(BASE_ENV, readFile);
-  expect(absent.requiredChecks).toEqual([DEFAULT_REQUIRED_CHECK]);
-  expect(() => loadConfig({ ...BASE_ENV, CR_REQUIRED_CHECKS: ",,," }, readFile)).toThrow();
+test("an absent CR_REQUIRED_CHECKS and a malformed one are both config errors naming the variable", () => {
+  // Neither collapses to a default or to an empty list: both are configuration
+  // mistakes the operator must fix, and both errors must say which variable.
+  const env = { ...BASE_ENV };
+  delete env["CR_REQUIRED_CHECKS"];
+  expect(() => loadConfig(env, readFile)).toThrow(/CR_REQUIRED_CHECKS/);
+  expect(() => loadConfig({ ...BASE_ENV, CR_REQUIRED_CHECKS: ",,," }, readFile)).toThrow(
+    /CR_REQUIRED_CHECKS/,
+  );
 });
 
 test("a private key that cannot be read reports the path, and the error contains no key material", () => {

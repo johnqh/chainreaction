@@ -3,12 +3,13 @@ import { probeRepo } from "../../src/prepare/probe";
 import type { ProtectionProbe, RepoAdminApi, RepoMeta } from "../../src/prepare/adminApi";
 
 function api(
-  over: Partial<{ meta: RepoMeta; protection: ProtectionProbe; file: boolean }> = {},
+  over: Partial<{ meta: RepoMeta; protection: ProtectionProbe; file: boolean; checkRuns: string[] }> = {},
 ): RepoAdminApi {
   return {
     getRepo: async () => over.meta ?? { defaultBranch: "main", isPrivate: false, allowAutoMerge: false },
     getProtection: async () => over.protection ?? { status: 404 },
     hasFile: async () => over.file ?? false,
+    listCheckRuns: async () => over.checkRuns ?? [],
     setProtection: async () => { throw new Error("not called in probe"); },
     enableAutoMerge: async () => { throw new Error("not called in probe"); },
   };
@@ -77,9 +78,13 @@ test("an unexpected status is not silently treated as unavailable", async () => 
   await expect(probeRepo(api({ protection: { status: 500 } }), "acme/lib")).rejects.toThrow(/500/);
 });
 
-test("carries the default branch, auto-merge flag and workflow presence through", async () => {
+test("carries the default branch, auto-merge flag, workflow presence and observed checks through", async () => {
   const caps = await probeRepo(
-    api({ meta: { defaultBranch: "trunk", isPrivate: false, allowAutoMerge: true }, file: true }),
+    api({
+      meta: { defaultBranch: "trunk", isPrivate: false, allowAutoMerge: true },
+      file: true,
+      checkRuns: ["build", "test"],
+    }),
     "acme/lib",
   );
   expect(caps).toEqual({
@@ -90,7 +95,16 @@ test("carries the default branch, auto-merge flag and workflow presence through"
     requiresReviews: false,
     autoMergeEnabled: true,
     hasValidationWorkflow: true,
+    observedChecks: ["build", "test"],
   });
+});
+
+test("queries check-runs against the default branch, not a hardcoded ref", async () => {
+  const seen: string[] = [];
+  const a = api({ meta: { defaultBranch: "trunk", isPrivate: false, allowAutoMerge: false } });
+  a.listCheckRuns = async (_f, ref) => { seen.push(ref); return []; };
+  await probeRepo(a, "acme/lib");
+  expect(seen).toEqual(["trunk"]);
 });
 
 test("the workflow path is a parameter, not hardcoded", async () => {

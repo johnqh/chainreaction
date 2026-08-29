@@ -11,6 +11,14 @@ export interface RepoCapabilities {
   requiresReviews: boolean;
   autoMergeEnabled: boolean;
   hasValidationWorkflow: boolean;
+  /**
+   * Distinct check-run names GitHub has ever reported on the default
+   * branch's tip commit. `assess` compares each configured required check
+   * against this list — a required status check GitHub has never reported
+   * will never be satisfied, and branch protection would then wait on it
+   * forever for every pull request, not only ChainReaction's.
+   */
+  observedChecks: string[];
 }
 
 export interface PrepareResult {

@@ -32,11 +32,11 @@ export function realDeps(config: CliConfig, fetchFn: typeof fetch = fetch): CliD
   // setProtection. This is the only place planCascade learns anything about
   // repo readiness, so plan can never mutate through it.
   //
-  // Sequential on purpose, not an oversight: assessRepo -> probeRepo issues 3
-  // requests per repo (getRepo, then getProtection + hasFile in parallel).
-  // GitHub's secondary rate limits trigger on concurrency, not volume — a
-  // 60-package cascade run with Promise.all here would fire 180 concurrent
-  // requests and get 403'd. GitHubGraphSource.load() already takes one
+  // Sequential on purpose, not an oversight: assessRepo -> probeRepo issues 4
+  // requests per repo (getRepo, then getProtection + hasFile + listCheckRuns
+  // in parallel). GitHub's secondary rate limits trigger on concurrency, not
+  // volume — a 60-package cascade run with Promise.all here would fire 240
+  // concurrent requests and get 403'd. GitHubGraphSource.load() already takes one
   // manifest at a time for the same reason (see its doc comment). Bounded
   // concurrency would help throughput, but is only safe to add once
   // retry/backoff exists upstream of it — without that, a 403 from a burst of

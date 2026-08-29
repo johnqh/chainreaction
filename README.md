@@ -57,16 +57,33 @@ The workflow is short enough to read in full before you add it. In summary:
   package the workflow invokes (`bunx ...`), not inline in the YAML — so the file you're auditing stays
   short, and fixes to that logic ship without asking every repository to update its copy of this file.
 
-### The job name must not change
+### The required status check is your own CI, never this workflow
 
-The job in this workflow is named `chainreaction-validate`. That exact name is the **required status
-check** ChainReaction sets on your default branch during Prepare. If you rename the job, GitHub will
-never report a check by that name again, branch protection will wait on it forever, and **every** pull
-request to your repository — yours as much as ChainReaction's — becomes permanently unmergeable. A test
-in this repository (`tests/validate/workflowTemplate.test.ts`) parses the shipped template and asserts
-its job name against the constant ChainReaction uses (`DEFAULT_REQUIRED_CHECK` in
-`src/prepare/probe.ts`), so the two cannot silently drift apart in what ChainReaction ships — but if you
-edit your own copy of the file, keep that name exactly as it is.
+This workflow (`chainreaction-validate`) only ever runs via `workflow_dispatch`, dispatched once per
+level of a cascade to prove the whole changeset builds and tests together *before* any pull request
+exists. A required status check, by contrast, is evaluated against a pull request's head commit — a
+dispatched run never attaches to one. So `chainreaction-validate` can never be, and must never be
+configured as, a required status check: doing so would make branch protection wait forever on a check
+that never arrives, and **every** pull request to your repository — yours as much as ChainReaction's —
+would become permanently unmergeable.
+
+The status check that actually gates merging is the one your repository's **own existing CI** already
+produces on pull requests (e.g. `build`, `test`, `ci`). Set that name via `CR_REQUIRED_CHECKS` when
+running ChainReaction's CLI — there is no default, on purpose, so this can never silently be filled in
+with the wrong check. **Prepare verifies the name you gave actually exists** — it lists the check-runs
+GitHub has reported on your default branch and blocks, naming what it found instead, if the one you
+configured has never appeared there. This is why a downstream cascade PR can start red: its manifest
+references a version not yet published, so its own CI fails at install; once the upstream package
+publishes and that PR is updated, the same CI re-runs and turns green. That red-then-green cycle, on
+your own CI's check, is the entire cascade mechanism — `chainreaction-validate`'s job name has no part
+in it, and you are free to rename it.
+
+The job name and file path are still both worth getting right for a different reason: **Prepare checks
+for the file at the exact path** `.github/workflows/chainreaction-validate.yml` (see above) and won't
+proceed until it's there, and the job's `name:` field is only ever seen by a human reading your Actions
+log. `tests/validate/workflowTemplate.test.ts` asserts the properties that are actually load-bearing —
+the `workflow_dispatch` trigger with its `cascade_id` input, the `id-token: write` permission, and that
+the claim response is never echoed — not the job name.
 
 ## Development
 
