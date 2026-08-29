@@ -1,5 +1,5 @@
 import type { ChangesetEntry } from "../graph/types";
-import type { GhClient } from "../github/client";
+import type { PrApi } from "../github/prApi";
 import { Cascade, detectStall, type NodeState } from "./state";
 
 const STALL_TIMEOUT_MS = 15 * 60_000;
@@ -8,7 +8,7 @@ export async function pollOnce(
   cascade: Cascade,
   entries: ChangesetEntry[],
   prs: Map<string, number>,
-  gh: GhClient,
+  gh: PrApi,
   now: number = Date.now(),
 ): Promise<void> {
   for (const entry of entries) {

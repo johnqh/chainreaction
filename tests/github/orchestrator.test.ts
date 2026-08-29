@@ -60,7 +60,7 @@ test("prState parses the gh JSON response", async () => {
 test("openPr throws when gh output contains no PR pattern", async () => {
   const gh = new GhClient(async () => "something went wrong\n");
   expect(async () => {
-    await gh.openPr("johnqh/design_system", "test-branch", "title", "body");
+    await gh.openPr("johnqh/design_system", "test-branch", "main", "title", "body");
   }).toThrow();
 });
 

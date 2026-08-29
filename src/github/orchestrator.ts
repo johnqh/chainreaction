@@ -1,5 +1,6 @@
 import type { ChangesetEntry } from "../graph/types";
 import type { GhClient } from "./client";
+import type { PrApi } from "./prApi";
 
 function prBody(entry: ChangesetEntry): string {
   const causes = Object.entries(entry.depBumps)
@@ -18,13 +19,14 @@ function prBody(entry: ChangesetEntry): string {
 
 export async function openChangesetPrs(
   entries: ChangesetEntry[],
-  gh: GhClient,
+  gh: PrApi,
   branch: string,
+  base = "main",
 ): Promise<Map<string, number>> {
   const prs = new Map<string, number>();
   for (const entry of entries) {
     const title = `chore: ${entry.pkg}@${entry.toVersion}`;
-    prs.set(entry.repo, await gh.openPr(entry.repo, branch, title, prBody(entry)));
+    prs.set(entry.repo, await gh.openPr(entry.repo, branch, base, title, prBody(entry)));
   }
   return prs;
 }
