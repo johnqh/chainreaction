@@ -10,23 +10,34 @@
 // `session: SessionPayload | null` (never reads a cookie or a client-supplied
 // installation id itself) and is scoped to `session.installationId` alone. A
 // missing/invalid session is always a flat 401 — never a fall-through to a
-// default installation. A repo or PR named in a request body, on the
-// mutating routes (/api/prs, /api/merge, /api/train, /api/published), is
-// only ever acted on after confirming it belongs to the *signed-in user's*
-// own accessible repos within that installation — via `ownedRepos`, which
-// calls `GET /user/installations/{id}/repositories` with the user's own
-// OAuth token (decrypted from the session) — freshly re-checked on every
-// mutating call. This is deliberately never the App installation's own repo
-// list (`GET /installation/repositories`, fetched with the App's token):
-// GitHub grants the App access to a repo the instant *any* member of the
-// installation's account can see it, so gating on the App's reach would let
-// a read-only org member, or an outside collaborator on one unrelated repo,
-// open and merge PRs across every repo the App can reach — a confused
-// deputy. `/api/prs` and `/api/train` additionally re-verify the user still
-// belongs to the installation at all (`assertInstallationMembership`) before
-// touching anything, so a removed collaborator or a revoked installation
-// loses write access on their very next mutating call, not just at the end
-// of the session TTL.
+// default installation. The guarantee is symmetric across reads and writes:
+// a repo or PR named in a request body, on the mutating routes (/api/prs,
+// /api/merge, /api/train, /api/published), is only ever acted on after
+// confirming it belongs to the *signed-in user's* own accessible repos
+// within that installation; a repo, package, version, or dependency edge is
+// likewise never *returned* by a read route (/api/repos, /api/graph,
+// /api/update) unless it belongs to that same accessible set — via
+// `ownedRepos`, which calls `GET /user/installations/{id}/repositories`
+// with the user's own OAuth token (decrypted from the session) — freshly
+// re-checked on every call, read or write. This is deliberately never the
+// App installation's own repo list (`GET /installation/repositories`,
+// fetched with the App's token): GitHub grants the App access to a repo the
+// instant *any* member of the installation's account can see it, so gating
+// on the App's reach would let a read-only org member, or an outside
+// collaborator on one unrelated repo, both act on and *read back the
+// existence of* every repo/package the App can reach — a confused deputy on
+// both axes, not just the write one. `GitHubGraphSource` still loads the
+// full, App-scoped graph (`/api/graph` and `/api/update` need the whole
+// installation's dependency edges to compute a correct chain — a
+// downstream consumer the user cannot see still needs to be walked to keep
+// the chain internally consistent), but every response is filtered to the
+// user's own accessible repos before it leaves this file — see
+// `filterGraphToOwnedRepos`/`filterSkippedToOwnedRepos` below. `/api/prs`
+// and `/api/train` additionally re-verify the user still belongs to the
+// installation at all (`assertInstallationMembership`) before touching
+// anything, so a removed collaborator or a revoked installation loses write
+// access on their very next mutating call, not just at the end of the
+// session TTL.
 import type { SessionPayload } from "../auth/session";
 import { TokenStore, type AppCredentials } from "../auth/appAuth";
 import {
@@ -39,7 +50,7 @@ import { InstallationGitHubApi } from "../github/installationApi";
 import { InstallationPrApi, type PrApi } from "../github/prApi";
 import { InstallationRepoAdminApi } from "../prepare/installationAdminApi";
 import type { RepoAdminApi } from "../prepare/adminApi";
-import type { GitHubApi, RepoRef } from "../graph/githubSource";
+import type { GitHubApi, RepoRef, SkippedRepo } from "../graph/githubSource";
 import { GitHubGraphSource } from "../graph/githubSource";
 import { assessRepo } from "../prepare/prepare";
 import type { PrepareResult } from "../prepare/types";
@@ -196,8 +207,27 @@ function parseUpdateBody(raw: unknown): UpdateRequestBody | null {
 // ever matches a bare plain-semver version (`toVersion`) or a caret/tilde/bare
 // semver range (`depBumps` values) cannot be bypassed by a scheme we forgot to
 // list, because nothing outside the allowed shape can match at all.
+//
+// `SEMVER_RANGE` must accept a full semver core plus an optional prerelease
+// and/or build-metadata suffix, not just `\d+\.\d+\.\d+`: `planUpdateOne`
+// (src/plan/planUpdate.ts) builds a dependency's `depBumps` value as
+// `^${depNode.version}` straight from that dependency's *current* graph
+// version — untouched by `bumpPatch` — so a dependency currently published
+// at a prerelease tag (e.g. "1.2.3-beta.1") produces "^1.2.3-beta.1" here.
+// The narrower digits-only grammar rejected that legitimate, planner-emitted
+// range outright: `/api/update` would return 200 with it, and the very next
+// `/api/prs` call feeding that same entry back would 400 as if the client
+// had sent malformed JSON. Widening the grammar to the prerelease/build
+// characters semver itself allows (`[0-9A-Za-z-]`, dot-separated, a literal
+// `-` before prerelease and `+` before build metadata) keeps this an
+// allowlist, not a denylist: none of those characters can ever spell a
+// scheme, a host, or a path separator, so `git+ssh://...`, `file:...`, and
+// every other rejected shape from Critical-B's original fix still cannot
+// match — the grammar only grew inside the "this is definitely a version
+// range" shape, never outside it.
 const PLAIN_SEMVER = /^\d+\.\d+\.\d+$/;
-const SEMVER_RANGE = /^[\^~]?\d+\.\d+\.\d+$/;
+const SEMVER_PRERELEASE_AND_BUILD = "(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?";
+const SEMVER_RANGE = new RegExp(`^[\\^~]?\\d+\\.\\d+\\.\\d+${SEMVER_PRERELEASE_AND_BUILD}$`);
 
 function isChangesetEntry(v: unknown): v is ChangesetEntry {
   if (!isRecord(v)) return false;
@@ -218,9 +248,30 @@ function isChangesetEntry(v: unknown): v is ChangesetEntry {
 /**
  * Defence in depth behind `isChangesetEntry`'s format check: even a
  * well-formed (plain-semver, in-range-syntax) entry must still be something
- * the graph would actually produce. Re-derives the two graph-dependent facts
- * `applyEntry` trusts — `toVersion` and which packages `depBumps` may name —
- * and rejects anything that disagrees.
+ * the graph would actually produce. Re-derives the graph-dependent facts
+ * `applyEntry`/`openPrForEntry` trust — which repo owns `entry.pkg`,
+ * `toVersion`, and which packages `depBumps` may name — and rejects
+ * anything that disagrees.
+ *
+ * The `entry.repo === node.repo` check is not optional plumbing: `handlePrs`'s
+ * `foreign` check only confirms `entry.repo` is somewhere the *user* can act
+ * (a repo they own), never that `entry.repo` is where the graph actually
+ * says `entry.pkg` lives. Without this check here, a caller could pair a
+ * package name they merely know (possibly in a repo they cannot even see)
+ * with a repo of their own, and this route would happily branch, commit,
+ * and open a PR *on their own repo* carrying that other package's name and
+ * version — the App's write access narrowed to "repos the user can see",
+ * never to "repos the user can write", exactly the gap `ownedRepos`'s
+ * repo-visibility fix does not by itself close.
+ *
+ * Every message below is built only from values the caller already
+ * supplied (`entry.pkg`, `entry.repo`, `entry.toVersion`, a `depBumps` key)
+ * — never from a graph-derived value like `node.repo` or `node.version`.
+ * `entry.pkg` may name a real package in a repo the caller cannot see at
+ * all (see this module's doc comment on read-side scoping); echoing back
+ * *which* repo actually owns it, or its real current version, would turn
+ * this validator into an oracle for exactly the information Critical-1's
+ * read-side filtering exists to hide.
  *
  * Deliberately not a full re-run of `planUpdateOne`/`planUpdateChain`: this
  * route receives one flat `entries[]` array with no `pkg`/`mode` telling it
@@ -230,6 +281,7 @@ function isChangesetEntry(v: unknown): v is ChangesetEntry {
  * doc comment) — replaying that sequencing here would mean reimplementing
  * the planner just to re-validate its output. What *is* cheap and load-
  * bearing to check, per package, against the graph alone:
+ *   - `entry.repo` is exactly the repo the graph says owns `entry.pkg`;
  *   - `toVersion` is exactly `bumpPatch` of that package's current graph
  *     version (true for every entry produced by either planner, at every
  *     chain level, since each package always bumps its own current version);
@@ -251,9 +303,12 @@ function validateEntriesAgainstGraph(
     if (!node) {
       return `${entry.pkg} is not in the dependency graph`;
     }
+    if (node.repo !== entry.repo) {
+      return `${entry.pkg} does not belong to repo "${entry.repo}"`;
+    }
     const expected = bumpPatch(node.version);
     if (entry.toVersion !== expected) {
-      return `${entry.pkg}: toVersion "${entry.toVersion}" does not match the graph-derived bump "${expected}"`;
+      return `${entry.pkg}: toVersion "${entry.toVersion}" does not match the graph-derived bump for this package`;
     }
     const edges = new Set([...node.deps, ...(node.devDeps ?? [])]);
     for (const dep of Object.keys(entry.depBumps)) {
@@ -354,15 +409,60 @@ function ownedReposErrorResponse(err: unknown, otherStatus: number): Response {
   return errorResponse(err, otherStatus);
 }
 
+/**
+ * Filters a full, App-scoped graph down to only the nodes whose `repo`
+ * belongs to `owned` — the read-side half of the same confused-deputy fix
+ * `ownedRepos` provides on the write side (see this module's doc comment).
+ * `GitHubGraphSource` itself must still walk the whole installation to
+ * compute correct dependency edges; this is what stops that full picture
+ * from ever reaching a response. `classifyEdges` (src/web/graphModel.ts)
+ * already drops any edge whose `to` package isn't present in the `nodes`
+ * array it's given, so calling it with the *filtered* node list (as every
+ * caller here does) is sufficient to also drop edges into a hidden package
+ * — there is no separate edge-filtering step to forget.
+ */
+function filterGraphToOwnedRepos(
+  graph: Map<string, RepoNode>,
+  owned: Map<string, RepoRef>,
+): Map<string, RepoNode> {
+  const visible = new Map<string, RepoNode>();
+  for (const [pkg, node] of graph) {
+    if (owned.has(node.repo)) visible.set(pkg, node);
+  }
+  return visible;
+}
+
+/** Same filtering as `filterGraphToOwnedRepos`, for the skipped-repo diagnostics list — a repo name the user can't see must not leak through there either. */
+function filterSkippedToOwnedRepos(skipped: SkippedRepo[], owned: Map<string, RepoRef>): SkippedRepo[] {
+  return skipped.filter((s) => owned.has(s.repo));
+}
+
 // --- route handlers ------------------------------------------------------------
 
-async function handleRepos(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
+async function handleRepos(
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+  session: SessionPayload,
+): Promise<Response> {
   let repos: RepoRef[];
   try {
     repos = await apis.githubApi.listRepos();
   } catch (err) {
     return errorResponse(err, 502);
   }
+
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+  // Filtered before assessRepo ever runs, not after: assessRepo issues 6+
+  // requests per repo, so this is also what stops a repo the user can't see
+  // from costing any work, not just from appearing in the response.
+  repos = repos.filter((r) => owned.has(r.fullName));
 
   const requiredChecks = await deps.requiredChecksFor(installationId);
 
@@ -388,7 +488,12 @@ async function handleRepos(apis: InstallationApis, deps: ApiDeps, installationId
   return jsonResponse({ repos: results });
 }
 
-async function handleGraph(apis: InstallationApis, deps: ApiDeps, installationId: number): Promise<Response> {
+async function handleGraph(
+  apis: InstallationApis,
+  deps: ApiDeps,
+  installationId: number,
+  session: SessionPayload,
+): Promise<Response> {
   const scope = await deps.scopeFor(installationId);
   const source = new GitHubGraphSource(apis.githubApi, scope);
   let graph: Map<string, RepoNode>;
@@ -397,9 +502,20 @@ async function handleGraph(apis: InstallationApis, deps: ApiDeps, installationId
   } catch (err) {
     return errorResponse(err, 502);
   }
-  const nodes = [...graph.values()];
+
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+
+  const visibleGraph = filterGraphToOwnedRepos(graph, owned);
+  const nodes = [...visibleGraph.values()];
   const edges = classifyEdges(nodes);
-  return jsonResponse({ nodes, edges, skipped: source.skipped });
+  const skipped = filterSkippedToOwnedRepos(source.skipped, owned);
+  return jsonResponse({ nodes, edges, skipped });
 }
 
 async function handleUpdate(
@@ -407,6 +523,7 @@ async function handleUpdate(
   apis: InstallationApis,
   deps: ApiDeps,
   installationId: number,
+  session: SessionPayload,
 ): Promise<Response> {
   const raw = await readJsonBody(req);
   const body = parseUpdateBody(raw);
@@ -423,7 +540,20 @@ async function handleUpdate(
     return errorResponse(err, 502);
   }
 
-  if (!graph.has(body.pkg)) {
+  const fetchFn = deps.fetchFn ?? fetch;
+  let owned: Map<string, RepoRef>;
+  try {
+    owned = await ownedRepos(session, fetchFn);
+  } catch (err) {
+    return ownedReposErrorResponse(err, 502);
+  }
+
+  // `graph.has(body.pkg)` alone would tell an attacker "this package exists
+  // somewhere in the installation" even when its repo is one they cannot
+  // see — the same 404 covers both "genuinely unknown" and "exists, but not
+  // visible to you" so the two are indistinguishable from the response.
+  const node = graph.get(body.pkg);
+  if (!node || !owned.has(node.repo)) {
     return jsonResponse({ error: `unknown package: ${body.pkg}` }, 404);
   }
 
@@ -438,7 +568,14 @@ async function handleUpdate(
     return errorResponse(err, 400);
   }
 
-  return jsonResponse({ entries, skipped: source.skipped });
+  // The root package is visible, but a chain can walk into a downstream
+  // consumer elsewhere in the installation the user cannot see — never
+  // return a changeset entry (or a skipped-repo diagnostic) for a repo
+  // outside the user's own accessible list, same as /api/graph.
+  const visibleEntries = entries.filter((e) => owned.has(e.repo));
+  const skipped = filterSkippedToOwnedRepos(source.skipped, owned);
+
+  return jsonResponse({ entries: visibleEntries, skipped });
 }
 
 /**
@@ -809,10 +946,14 @@ export async function handleApiRequest(
   // this line reads an installation id from the request itself.
   const apis = deps.apisFor(session.installationId);
 
-  if (url.pathname === "/api/repos" && req.method === "GET") return handleRepos(apis, deps, session.installationId);
-  if (url.pathname === "/api/graph" && req.method === "GET") return handleGraph(apis, deps, session.installationId);
+  if (url.pathname === "/api/repos" && req.method === "GET") {
+    return handleRepos(apis, deps, session.installationId, session);
+  }
+  if (url.pathname === "/api/graph" && req.method === "GET") {
+    return handleGraph(apis, deps, session.installationId, session);
+  }
   if (url.pathname === "/api/update" && req.method === "POST") {
-    return handleUpdate(req, apis, deps, session.installationId);
+    return handleUpdate(req, apis, deps, session.installationId, session);
   }
   if (url.pathname === "/api/prs" && req.method === "POST") {
     return handlePrs(req, apis, deps, session);

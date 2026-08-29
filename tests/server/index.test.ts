@@ -638,8 +638,23 @@ test("a hosted API route is scoped to the signed-in session's installation, end 
     };
   })();
 
+  // handleRepos now also calls ownedRepos (Critical-1's read-side fix),
+  // which needs its own fetchFn for GET /user/installations/{id}/repositories
+  // — deliberately a separate ApiDeps.fetchFn from ServerDeps.fetchFn (the
+  // top-level one that drives the OAuth login flow above), so this must be
+  // supplied here rather than reusing mockFetch(). The session's
+  // installationId is 1 (mockFetch()'s default), and an empty repo list here
+  // keeps this test's `{ repos: [] }` expectation intact.
+  const apiFetchFn = (async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.startsWith("https://api.github.com/user/installations/1/repositories")) {
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    }
+    return new Response("unexpected request in test double: " + url, { status: 404 });
+  }) as unknown as typeof fetch;
+
   const deps = makeDeps({
-    api: { apisFor: factory, scopeFor: () => "@acme/", requiredChecksFor: () => [] },
+    api: { apisFor: factory, scopeFor: () => "@acme/", requiredChecksFor: () => [], fetchFn: apiFetchFn },
   });
 
   await withServer(deps, async (baseUrl) => {

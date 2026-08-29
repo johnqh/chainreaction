@@ -304,12 +304,13 @@ test("GET /api/repos reports a non-ready prepared state (never throws) when asse
 // --- GET /api/graph ------------------------------------------------------------
 
 test("GET /api/graph returns nodes, edges tagged dependency/devDependency, and skipped repos", async () => {
+  const repos: RepoRef[] = [
+    { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+    { fullName: "acme/components", private: false, defaultBranch: "trunk" },
+    { fullName: "acme/broken", private: false, defaultBranch: "trunk" },
+  ];
   const { api: github } = fakeGitHubApi({
-    repos: [
-      { fullName: "acme/design", private: false, defaultBranch: "trunk" },
-      { fullName: "acme/components", private: false, defaultBranch: "trunk" },
-      { fullName: "acme/broken", private: false, defaultBranch: "trunk" },
-    ],
+    repos,
     manifests: {
       "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
       "acme/components": JSON.stringify({
@@ -322,7 +323,11 @@ test("GET /api/graph returns nodes, edges tagged dependency/devDependency, and s
     },
   });
   const { factory } = factoryFor(makeApis({ github }));
-  const deps = baseDeps({ apisFor: factory });
+  // The user's own accessible repos must include acme/broken too — this
+  // test isn't exercising the read-side confused-deputy filter, so keep the
+  // two lists in sync (see the dedicated read-side tests below for what
+  // happens when they deliberately differ).
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ repos }).fetchFn });
   const res = await call("/api/graph", deps, session());
   expect(res.status).toBe(200);
   const body = (await res.json()) as {
@@ -538,6 +543,76 @@ test("POST /api/prs rejects a depBumps value that is not a plain semver range (e
   expect(prCalls).toEqual([]);
 });
 
+// --- Important 2: the semver allowlist must accept what the planner
+// actually emits. planUpdateOne builds a dependency's depBumps value as
+// `^${depNode.version}` straight from that dependency's CURRENT graph
+// version, untouched by bumpPatch — so a dependency published at a
+// prerelease tag produces a depBumps range like "^1.2.3-beta.1". Nothing
+// before this test round-tripped /api/update's own output through
+// /api/prs, which is how the too-narrow grammar got through: read alone,
+// /api/update looked fine, and /api/prs's own tests only ever hand-built
+// entries with plain-semver depBumps values. ---------------------------------
+
+test("POST /api/update's own output, for a dependency published at a prerelease version, is accepted verbatim by POST /api/prs — the round trip a real 'Open PRs' click performs", async () => {
+  const { api: github } = fakeGitHubApi({
+    manifests: {
+      // @acme/design is currently published at a prerelease tag.
+      "acme/design": JSON.stringify({ name: "@acme/design", version: "1.2.3-beta.1" }),
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        dependencies: { "@acme/design": "^1.0.0" },
+      }),
+    },
+  });
+  const { api: pr, putFileContents } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ github, pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const updateRes = await call("/api/update", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/components", mode: "one" }),
+  });
+  expect(updateRes.status).toBe(200);
+  const updateBody = (await updateRes.json()) as { entries: ChangesetEntry[] };
+  expect(updateBody.entries).toHaveLength(1);
+  // Sanity: this is genuinely the shape that used to 400 — a prerelease tag
+  // in the depBumps value, not something this test manufactured by hand.
+  expect(updateBody.entries[0]!.depBumps["@acme/design"]).toBe("^1.2.3-beta.1");
+
+  const prsRes = await call("/api/prs", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries: updateBody.entries }),
+  });
+  expect(prsRes.status).toBe(200);
+  const components = JSON.parse(putFileContents["acme/components:package.json"]!);
+  expect(components.dependencies["@acme/design"]).toBe("^1.2.3-beta.1");
+});
+
+test("the semver-range grammar still rejects a scheme smuggled in alongside a valid-looking prerelease/build suffix", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  const raw = {
+    entries: [
+      {
+        pkg: "@acme/components",
+        repo: "acme/components",
+        toVersion: "2.0.1",
+        fromVersion: "2.0.0",
+        // Anchored full-string match means a trailing/leading scheme can't
+        // ride along with an otherwise-valid-looking version suffix either.
+        depBumps: { "@acme/design": "^1.0.0-git+ssh://evil.example/pwn.git" },
+        level: 0,
+      },
+    ],
+  };
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify(raw) });
+  expect(res.status).toBe(400);
+  expect(prCalls).toEqual([]);
+});
+
 test("POST /api/prs never opens a PR for a repo with no package.json — rejected before any GitHub write, since a manifestless repo never enters the graph", async () => {
   const { api: github } = fakeGitHubApi({
     manifests: {
@@ -608,6 +683,35 @@ test("POST /api/prs rejects a malformed body", async () => {
   const deps = baseDeps();
   const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries: [{}] }) });
   expect(res.status).toBe(400);
+});
+
+// --- Important 1: the ownedRepos fail-open path is untested on 3 of 4
+// mutating routes — only /api/merge had these. Verified: without these,
+// reverting /api/prs's ownedRepos catch to fall back to
+// apis.githubApi.listRepos() (the App's own reach) leaves the suite green. --
+
+test("POST /api/prs reports 502 when ownedRepos itself fails for a reason other than a rejected token (a systemic failure)", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposFailStatus: 500 }).fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(502);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/prs reports 401 (sign in again), not a fallback to the App's own repo list, when the user's own token is rejected fetching their accessible repos", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposRejected: true }).fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "1.0.1" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(401);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).not.toContain(DEFAULT_USER_TOKEN);
+  expect(prCalls).toEqual([]);
 });
 
 // --- POST /api/merge -----------------------------------------------------------
@@ -792,6 +896,38 @@ test("POST /api/train rejects a malformed body", async () => {
   expect(res.status).toBe(400);
 });
 
+// --- Important 1: the ownedRepos fail-open path is untested here too. ------
+
+test("POST /api/train reports 502 when ownedRepos itself fails for a reason other than a rejected token (a systemic failure)", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposFailStatus: 500 }).fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  expect(res.status).toBe(502);
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/train reports 401 (sign in again), not a fallback to the App's own repo list, when the user's own token is rejected", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ reposRejected: true }).fetchFn });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/train", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ entries, prs: { "acme/design": 10 } }),
+  });
+  expect(res.status).toBe(401);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).not.toContain(DEFAULT_USER_TOKEN);
+  expect(prCalls).toEqual([]);
+});
+
 // --- POST /api/published ---------------------------------------------------------
 //
 // Exists so a manual "Refresh" in the web UI can ask the real question —
@@ -845,6 +981,42 @@ test("POST /api/published rejects a malformed body", async () => {
   const deps = baseDeps();
   const res = await call("/api/published", deps, session(), { method: "POST", body: JSON.stringify({ entries: [] }) });
   expect(res.status).toBe(400);
+});
+
+// --- Important 1: the ownedRepos fail-open path is untested here too. ------
+
+test("POST /api/published reports 502 when ownedRepos itself fails for a reason other than a rejected token (a systemic failure)", async () => {
+  let calls = 0;
+  const deps = baseDeps({
+    fetchFn: userScopedFetch({ reposFailStatus: 500 }).fetchFn,
+    isResolvable: async () => {
+      calls++;
+      return true;
+    },
+  });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/published", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(502);
+  expect(calls).toBe(0);
+});
+
+test("POST /api/published reports 401 (sign in again), not a fallback to the App's own repo list, when the user's own token is rejected", async () => {
+  let calls = 0;
+  const deps = baseDeps({
+    fetchFn: userScopedFetch({ reposRejected: true }).fetchFn,
+    isResolvable: async () => {
+      calls++;
+      return true;
+    },
+  });
+
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design" })];
+  const res = await call("/api/published", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(401);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).not.toContain(DEFAULT_USER_TOKEN);
+  expect(calls).toBe(0);
 });
 
 test("POST /api/published with no session is a flat 401", async () => {
@@ -949,6 +1121,150 @@ test("POST /api/merge still succeeds for a repo the signed-in user does own, on 
   expect(prCalls).toEqual(["mergePr:acme/design:7"]);
 });
 
+// --- Re-review Critical 1: the confused deputy was closed on the write
+// side only — every read route must also filter to the signed-in user's
+// own accessible repos, on the exact same confusedDeputyFixture. ------------
+
+test("GET /api/repos never returns a repo the App can reach but the signed-in user cannot", async () => {
+  const { deps } = confusedDeputyFixture();
+  const res = await call("/api/repos", deps, session());
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { repos: { name: string }[] };
+  const names = body.repos.map((r) => r.name).sort();
+  expect(names).toEqual(["acme/components", "acme/design"]);
+  expect(names).not.toContain("acme/secret");
+});
+
+test("GET /api/graph never returns a node, or an edge naming it, for a package in a repo the signed-in user cannot see", async () => {
+  const { deps } = confusedDeputyFixture();
+  const res = await call("/api/graph", deps, session());
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as {
+    nodes: { pkg: string; repo: string }[];
+    edges: { from: string; to: string }[];
+  };
+  expect(body.nodes.map((n) => n.pkg).sort()).toEqual(["@acme/components", "@acme/design"]);
+  expect(body.nodes.some((n) => n.repo === "acme/secret")).toBe(false);
+  expect(body.edges.some((e) => e.from === "@acme/secret" || e.to === "@acme/secret")).toBe(false);
+});
+
+test("POST /api/update rejects the root package with the same 404 as a genuinely unknown one, when its repo is invisible to the signed-in user — no oracle for 'exists but hidden'", async () => {
+  const { deps } = confusedDeputyFixture();
+  const visible = await call("/api/update", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/nope-does-not-exist-at-all", mode: "one" }),
+  });
+  const hidden = await call("/api/update", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/secret", mode: "one" }),
+  });
+  expect(hidden.status).toBe(404);
+  expect(hidden.status).toBe(visible.status);
+  // Same message *template* for both — "unknown package: <the pkg you
+  // asked about>" — so the response shape itself never distinguishes
+  // "genuinely absent" from "exists, but not visible to you"; each body
+  // naturally echoes back the caller's own requested pkg name (not a leak:
+  // they already knew what they asked for), so the two bodies legitimately
+  // differ only in that name, never in a graph-derived detail.
+  const hiddenBody = (await hidden.json()) as { error: string };
+  const visibleBody = (await visible.json()) as { error: string };
+  expect(hiddenBody.error).toBe("unknown package: @acme/secret");
+  expect(visibleBody.error).toBe("unknown package: @acme/nope-does-not-exist-at-all");
+});
+
+test("POST /api/update mode=chain filters a repo the signed-in user cannot see out of the returned changeset, even though the graph needed it to compute the chain correctly", async () => {
+  const repos: RepoRef[] = [...DEFAULT_REPOS, SECRET_REPO];
+  const { api: github } = fakeGitHubApi({
+    repos,
+    manifests: {
+      "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
+      "acme/components": JSON.stringify({
+        name: "@acme/components",
+        version: "2.0.0",
+        // @acme/components depends on @acme/secret too — dependencyClosure
+        // (which planUpdateChain walks) must still traverse into it to
+        // compute a correct chain, but the response must never say so.
+        dependencies: { "@acme/design": "^1.0.0", "@acme/secret": "^9.0.0" },
+      }),
+      "acme/secret": JSON.stringify({ name: "@acme/secret", version: "9.0.0" }),
+    },
+  });
+  const { factory } = factoryFor(makeApis({ github }));
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ repos: DEFAULT_REPOS }).fetchFn });
+
+  const res = await call("/api/update", deps, session(), {
+    method: "POST",
+    body: JSON.stringify({ pkg: "@acme/components", mode: "chain" }),
+  });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { entries: { pkg: string; repo: string }[] };
+  expect(body.entries.map((e) => e.pkg).sort()).toEqual(["@acme/components", "@acme/design"]);
+  expect(body.entries.some((e) => e.repo === "acme/secret")).toBe(false);
+});
+
+// --- Re-review Critical 2: entry.repo was never checked against the repo
+// the graph actually says owns entry.pkg — anyone who can merely *see* a
+// repo could point the App's write access at it while naming a completely
+// different package's identity and version. ---------------------------------
+
+test("POST /api/prs rejects an entry whose repo does not match the graph's own repo for that pkg, even when the named repo is genuinely owned and every field is well-formed", async () => {
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  // @acme/components really lives in acme/components — naming acme/design
+  // (a real, owned repo, just the wrong one for this pkg) must be rejected,
+  // not silently accepted and written to acme/design.
+  const entries = [entry({ pkg: "@acme/components", repo: "acme/design", toVersion: "2.0.1", depBumps: {} })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(400);
+  expect(prCalls).toEqual([]); // no branch/commit/PR ever attempted
+});
+
+test("POST /api/prs's repo-mismatch rejection never echoes the graph's real repo or version for a pkg the caller may not be entitled to see", async () => {
+  // Same confused-deputy shape as the read-side tests: acme/secret is real,
+  // has a real version, and is owned by nobody the caller controls — but
+  // the caller names it alongside a repo they DO own. This is rejected by
+  // the entry.repo===node.repo check itself (see the dedicated test above);
+  // this test additionally pins that its *message* never leaks which repo
+  // actually owns @acme/secret or what its real version is.
+  const { deps, prCalls } = confusedDeputyFixture();
+  const entries = [entry({ pkg: "@acme/secret", repo: "acme/design", toVersion: "1.0.1", depBumps: {} })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  // The real secret version is "9.0.0" — must never appear. Its full-name
+  // repo "acme/secret" is deliberately not asserted absent here: it happens
+  // to be a substring of the caller's own supplied "@acme/secret" pkg name,
+  // which is fine to echo (see the message-shape test below for the actual
+  // repo-identity assertion).
+  expect(body.error).not.toContain("9.0.0");
+  expect(prCalls).toEqual([]);
+});
+
+test("POST /api/prs's toVersion-mismatch message no longer echoes the graph-derived bumped version, even for a pkg/repo pair the caller does own", async () => {
+  // Once entry.repo===node.repo is required (Critical 2's primary fix), the
+  // only way to ever reach this branch at all is with a repo the caller
+  // already owns — so this pins general hygiene (an internal computed value
+  // dropped from an error message), not a live cross-tenant exploit in this
+  // codebase today. It is still exactly the line the review named, and
+  // still worth pinning: a future change to the ordering of these two
+  // checks would silently reopen the version-echo the review flagged.
+  const { api: pr, calls: prCalls } = fakePrApi();
+  const { factory } = factoryFor(makeApis({ pr }));
+  const deps = baseDeps({ apisFor: factory });
+
+  // @acme/design's real current version is "1.0.0" (bumpPatch -> "1.0.1");
+  // the caller supplies a deliberately wrong toVersion against its own,
+  // genuinely-owned repo.
+  const entries = [entry({ pkg: "@acme/design", repo: "acme/design", toVersion: "9.9.9" })];
+  const res = await call("/api/prs", deps, session(), { method: "POST", body: JSON.stringify({ entries }) });
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).not.toContain("1.0.1"); // the graph-derived correct bump
+  expect(prCalls).toEqual([]);
+});
+
 // --- Important H: mutating routes re-verify installation membership, not --
 // just repo ownership — a removed collaborator must lose access before the
 // session cookie's own TTL runs out. -----------------------------------------
@@ -991,6 +1307,7 @@ test("GET /api/repos resolves requiredChecks via requiredChecksFor(installationI
       seenIds.push(installationId);
       return ["ci"];
     },
+    fetchFn: userScopedFetch({ installationId: 77 }).fetchFn,
   });
   const res = await call("/api/repos", deps, session(77));
   expect(res.status).toBe(200);
@@ -1016,6 +1333,7 @@ test("GET /api/graph passes the session's own installationId to scopeFor, not a 
       seenIds.push(installationId);
       return "@acme/";
     },
+    fetchFn: userScopedFetch({ installationId: 91 }).fetchFn,
   });
   const res = await call("/api/graph", deps, session(91));
   expect(res.status).toBe(200);
@@ -1029,6 +1347,7 @@ test("POST /api/update resolves scope via scopeFor(installationId)", async () =>
       seenIds.push(installationId);
       return "@acme/";
     },
+    fetchFn: userScopedFetch({ installationId: 13 }).fetchFn,
   });
   const res = await call("/api/update", deps, session(13), {
     method: "POST",
@@ -1041,12 +1360,13 @@ test("POST /api/update resolves scope via scopeFor(installationId)", async () =>
 // --- Fix-round: /api/update must surface skipped repos, not just /api/graph ----
 
 test("POST /api/update surfaces skipped repos from the graph load, same as /api/graph", async () => {
+  const repos: RepoRef[] = [
+    { fullName: "acme/design", private: false, defaultBranch: "trunk" },
+    { fullName: "acme/components", private: true, defaultBranch: "trunk" },
+    { fullName: "acme/broken", private: false, defaultBranch: "trunk" },
+  ];
   const { api: github } = fakeGitHubApi({
-    repos: [
-      { fullName: "acme/design", private: false, defaultBranch: "trunk" },
-      { fullName: "acme/components", private: true, defaultBranch: "trunk" },
-      { fullName: "acme/broken", private: false, defaultBranch: "trunk" },
-    ],
+    repos,
     manifests: {
       "acme/design": JSON.stringify({ name: "@acme/design", version: "1.0.0" }),
       "acme/components": JSON.stringify({
@@ -1058,7 +1378,7 @@ test("POST /api/update surfaces skipped repos from the graph load, same as /api/
     },
   });
   const { factory } = factoryFor(makeApis({ github }));
-  const deps = baseDeps({ apisFor: factory });
+  const deps = baseDeps({ apisFor: factory, fetchFn: userScopedFetch({ repos }).fetchFn });
 
   const res = await call("/api/update", deps, session(), {
     method: "POST",
